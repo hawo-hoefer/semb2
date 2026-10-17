@@ -1,0 +1,13 @@
+[package]
+name = "semb2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+candle-core = "0.11.0"
+colog = "1.4.0"
+embed_anything = { version="0.7.0", default-features = false, features = ["rustls-tls", "ort", "cuda", "cudnn"] }
+log = "0.4.34"
+walkdir = "2.5.0"
+wincode = { version = "0.6.3", features = ["derive"] }
