@@ -87,8 +87,17 @@ struct DocData {
     page_embeddings: Tensor,
 }
 
+fn load_model() -> ColSmolEmbedder {
+    log::info!("Loading Model");
+    let ret = ColSmolEmbedder::new("akshayballal/colSmol-256M-merged", None).unwrap();
+    log::info!("Done Loading Model");
+    ret
+}
+
 fn main() {
     colog::init();
+
+    let load_model_handle = std::thread::spawn(load_model);
 
     let path = std::path::Path::new("/home/hawo/notes");
     let save_path = std::path::Path::new("./embeddings.bin");
@@ -130,11 +139,14 @@ fn main() {
             HashMap::new()
         });
 
-    let embed_model = ColSmolEmbedder::new("akshayballal/colSmol-256M-merged", None).unwrap();
-    let query_embedding = embed_query(&embed_model, "where can i find crystal structure definitions?")
-        .and_then(normalize)
-        .unwrap();
+    let embed_model = load_model_handle.join().unwrap();
 
+    let query_embedding = embed_query(
+        &embed_model,
+        "where can i find crystal structure definitions?",
+    )
+    .and_then(normalize)
+    .unwrap();
     for f in walkdir::WalkDir::new(path).into_iter().filter_map(|f| {
         match f {
             Ok(f)
