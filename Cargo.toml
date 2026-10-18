@@ -9,7 +9,7 @@ candle-core = "0.11.0"
 colog = "1.4.0"
 crossbeam-channel = "0.5.17"
 embed_anything = { version="0.7.0", default-features = false, features = ["rustls-tls", "ort", "cuda", "cudnn"] }
-iced = { version = "0.14.0", features = ["advanced", "smol"] }
+iced = { version = "0.14.0", features = ["advanced", "smol", "markdown"] }
 image = "0.25.10"
 log = "0.4.34"
 walkdir = "2.5.0"

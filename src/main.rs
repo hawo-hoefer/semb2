@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::{BufWriter, Read};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::Context;
-use candle_core::{CudaDevice, DType, Tensor};
+use candle_core::{DType, Tensor};
 use embed_anything::embeddings::local::colsmol::ColSmolEmbedder;
-use iced::futures::Stream;
-use iced::{Subscription, Task, stream};
+use iced::keyboard::Key;
+use iced::widget::operation::AbsoluteOffset;
+use iced::{Element, Subscription, Task, stream};
 use wincode::len::BincodeLen;
 
 fn max_sim(query_embedding: &Tensor, document_embedding: &Tensor) -> Result<Tensor, anyhow::Error> {
@@ -31,10 +31,10 @@ fn embed_file(
 ) -> Result<Tensor, anyhow::Error> {
     let pages = embed_anything::embeddings::local::colpali::get_images_from_pdf(&file_path)?;
     let mut embed_data = Vec::new();
-    for (index, batch) in pages.chunks(batch_size).enumerate() {
-        let start_page = index * batch_size + 1;
-        let end_page = start_page + batch.len();
-        let page_numbers = (start_page..=end_page).collect::<Vec<_>>();
+    for batch in pages.chunks(batch_size) {
+        // let start_page = index * batch_size + 1;
+        // let end_page = start_page + batch.len();
+        // let page_numbers = (start_page..=end_page).collect::<Vec<_>>();
         let (input_ids, attention_mask, pixel_values, pixel_attention_mask) =
             embedder.processor.preprocess(batch, &embedder.device)?;
 
@@ -85,7 +85,7 @@ struct SavedDocData {
     page_embedding_shape: Vec<usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct DocData {
     last_mtime: SystemTime,
     page_embeddings: Tensor,
@@ -125,19 +125,30 @@ enum EmbedResult {
 struct State {
     handles: EmbedHandles,
     query: String,
+    last_query: String,
     results: Vec<QueryResult>,
     loaded_files: HashMap<String, DocData>,
     init_focus: bool,
     device: candle_core::Device,
+    highlight_index: usize,
+    theme: iced::theme::Theme,
+    config: Config,
 }
 
-#[derive(Clone)]
+struct Config {
+    text_height: f32,
+    padding: f32,
+}
+
+#[derive(Clone, Debug)]
 enum Message {
     InputChanged(String),
     RunQuery,
     QueryProcessed(String, Tensor),
     DocumentProcessed(String, DocData),
     InitFocus,
+    Open,
+    MoveHighlight { down: bool },
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
@@ -146,7 +157,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.query = s;
             Task::none()
         }
-        Message::QueryProcessed(query_str, embedding) => {
+        Message::QueryProcessed(query, embedding) => {
+            state.highlight_index = 0;
             state.results.clear();
             for (path, v) in state.loaded_files.iter() {
                 let scores = max_sim(
@@ -164,28 +176,40 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     })
                 }
             }
+            state.last_query = query;
             state
                 .results
                 .sort_by(|a, b| f32::total_cmp(&b.score, &a.score));
-            Task::none()
+
+            iced::widget::operation::scroll_to(
+                "results",
+                AbsoluteOffset {
+                    x: None,
+                    y: Some(0.0),
+                },
+            )
         }
         Message::RunQuery => {
-            state
-                .handles
-                .query_request_tx
-                .send(state.query.clone())
-                .unwrap();
+            if state.query == state.last_query {
+                Task::done(Message::Open)
+            } else {
+                state
+                    .handles
+                    .query_request_tx
+                    .send(state.query.clone())
+                    .unwrap();
 
-            let h2 = state.handles.query_embedding_rx.clone();
-            Task::perform(
-                async move {
-                    match h2.recv() {
-                        Ok(v) => v,
-                        Err(error) => panic!("foo"),
-                    }
-                },
-                |x| Message::QueryProcessed(x.0, x.1),
-            )
+                let h2 = state.handles.query_embedding_rx.clone();
+                Task::perform(
+                    async move {
+                        match h2.recv() {
+                            Ok(v) => v,
+                            Err(_) => panic!("foo"),
+                        }
+                    },
+                    |x| Message::QueryProcessed(x.0, x.1),
+                )
+            }
         }
         Message::DocumentProcessed(path, doc_data) => {
             log::info!("Finished processing {path}");
@@ -241,29 +265,116 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.init_focus = true;
             iced::widget::operation::focus("query_widget")
         }
+        Message::MoveHighlight { down } => {
+            let n_results = state.results.len();
+            if n_results > 0 {
+                if down {
+                    state.highlight_index =
+                        (state.highlight_index as i64 + 1).rem_euclid(n_results as i64) as usize;
+                } else {
+                    state.highlight_index =
+                        (state.highlight_index as i64 - 1).rem_euclid(n_results as i64) as usize;
+                }
+            }
+            iced::widget::operation::scroll_to(
+                "results",
+                AbsoluteOffset {
+                    x: None,
+                    y: Some(
+                        state.highlight_index as f32
+                            * (state.config.text_height + state.config.padding)
+                            * 1.25,
+                    ),
+                },
+            )
+        }
+        Message::Open => {
+            if state.results.len() > 0 {
+                let selection = &state.results[state.highlight_index];
+                log::info!(
+                    "Opening current selection: {} at page {}",
+                    selection.path,
+                    selection.page
+                );
+                match std::process::Command::new("zathura")
+                    .args(&[
+                        selection.path.clone(),
+                        "--page".to_string(),
+                        selection.page.to_string(),
+                    ])
+                    .spawn()
+                {
+                    Ok(ok) => (),
+                    Err(err) => log::error!("Could not spawn viewer: {err}"),
+                }
+            }
+
+            Task::none()
+        }
     }
 }
 
-fn view(s: &State) -> iced::widget::Column<'_, Message> {
-    use iced::widget::{column, row, text, text_input};
-    let ti = text_input("Enter Your Query", &s.query)
+fn results(state: &State) -> Element<'_, Message> {
+    use iced::color;
+    use iced::widget::{column, container, rich_text, row, scrollable, span, text, text_input};
+    let palette = state.theme.palette();
+
+    container(
+        scrollable(column(
+            state
+                .results
+                .iter()
+                .enumerate()
+                .map(|(i, QueryResult { path, page, score })| {
+                    let fg = if i == state.highlight_index {
+                        palette.success
+                    } else {
+                        palette.text
+                    };
+
+                    container(
+                        rich_text([span(format!("{score:.3} {path} | {page}\n")).color(fg)])
+                            .on_link_click(iced::never)
+                            .size(state.config.text_height),
+                    )
+                    .padding(state.config.padding)
+                    .style(container::rounded_box)
+                    .id(format!("result-{i}"))
+                    .into()
+                })
+                .collect::<Vec<_>>(),
+        ))
+        .id("results"),
+    )
+    .padding(state.config.padding)
+    .style(container::rounded_box)
+    .into()
+}
+
+fn theme(s: &State) -> iced::Theme {
+    s.theme.clone()
+}
+
+fn view(state: &State) -> iced::Element<'_, Message> {
+    use iced::color;
+    use iced::widget::{column, container, rich_text, row, span, text, text_input};
+    let ti = text_input("Enter Your Query", &state.query)
         .on_input(Message::InputChanged)
         .on_submit(Message::RunQuery)
         .id("query_widget");
 
-    column!(
-        row!(
-            ti,
-            text(format!(
-                "Loading {} / {}",
-                s.handles.file_request_tx.len(),
-                s.loaded_files.len(),
-            ))
-        ),
-        column(s.results.iter().map(|QueryResult { path, page, score }| {
-            text(format!("{score:.3} {path} | {page}")).into()
-        }))
-    )
+    let in_queue = state.handles.file_request_tx.len();
+    let loaded = state.loaded_files.len();
+    let total = in_queue + loaded;
+
+    container(column!(
+        container(iced::widget::progress_bar(0.0..=total as f32, loaded as f32).girth(10))
+            .padding([state.config.padding, 0.0]),
+        ti,
+        container(results(state)).padding([state.config.padding, 0.0])
+    ))
+    .padding(state.config.padding)
+    .into()
 }
 
 struct EmbedThread {
@@ -409,6 +520,13 @@ fn new() -> State {
         handles,
         init_focus: false,
         device,
+        highlight_index: 0,
+        theme: iced::theme::Theme::GruvboxDark,
+        config: Config {
+            text_height: 20.0,
+            padding: 5.0,
+        },
+        last_query: String::from(""),
     }
 }
 
@@ -455,7 +573,7 @@ fn load_saved_embeddings(
 }
 
 fn init_focus() -> impl iced::futures::Stream<Item = Message> {
-    use iced::futures::{SinkExt, StreamExt};
+    use iced::futures::SinkExt;
     stream::channel(1, async |mut output| {
         output.send(Message::InitFocus).await;
     })
@@ -483,7 +601,38 @@ fn main() -> iced::Result {
                     })
                 }))
             }
+            subscriptions.push(iced::keyboard::listen().filter_map(|x| match x {
+                iced::keyboard::Event::KeyPressed {
+                    key,
+                    modified_key: _,
+                    physical_key: _,
+                    location: _,
+                    modifiers,
+                    text,
+                    repeat: _,
+                } => {
+                    dbg!(key == Key::Character("o".into()), modifiers.control());
+                    if key == Key::Named(iced::keyboard::key::Named::Tab) {
+                        Some(Message::MoveHighlight {
+                            down: !modifiers.shift(),
+                        })
+                    } else if key == Key::Character("o".into()) && modifiers.control() {
+                        Some(Message::Open)
+                    } else {
+                        None
+                    }
+                }
+                iced::keyboard::Event::KeyReleased {
+                    key: _,
+                    modified_key: _,
+                    physical_key: _,
+                    location: _,
+                    modifiers: _,
+                } => None,
+                iced::keyboard::Event::ModifiersChanged(_) => None,
+            }));
             Subscription::batch(subscriptions)
         })
+        .theme(theme)
         .run()
 }
