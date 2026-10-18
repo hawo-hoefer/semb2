@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::io::{BufReader, BufWriter, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -355,8 +355,24 @@ enum Message {
     SetTheme(_Theme),
     SetSpacing(f32),
     SetPadding(f32),
-    UpdateViewerProgram(String),
-    UpdateViewerPageArg(String),
+    SetViewerProgram(String),
+    SetViewerPageArg(String),
+}
+
+fn save_config(cfg: &Config, to: impl AsRef<std::path::Path>) -> Result<(), anyhow::Error> {
+    let serialized = toml::to_string_pretty(cfg).context("serialize config")?;
+
+    std::fs::File::create(to.as_ref())
+        .map_err(anyhow::Error::new)
+        .context("(re-)create config file")
+        .map(BufWriter::new)
+        .and_then(|mut x| {
+            x.write(serialized.as_bytes())
+                .context("Write config to file")?;
+            Ok(())
+        })?;
+
+    Ok(())
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
@@ -524,22 +540,27 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::SetTheme(_theme) => {
             state.config.theme = _theme.into();
+            save_config(&state.config, "./config.toml").unwrap();
             Task::none()
         }
         Message::SetSpacing(spacing) => {
             state.config.spacing = spacing;
+            save_config(&state.config, "./config.toml").unwrap();
             Task::none()
         }
         Message::SetPadding(padding) => {
             state.config.padding = padding;
+            save_config(&state.config, "./config.toml").unwrap();
             Task::none()
         }
-        Message::UpdateViewerProgram(program) => {
+        Message::SetViewerProgram(program) => {
             state.config.viewer.program_name = program;
+            save_config(&state.config, "./config.toml").unwrap();
             Task::none()
         }
-        Message::UpdateViewerPageArg(arg) => {
+        Message::SetViewerPageArg(arg) => {
             state.config.viewer.page_arg = arg;
+            save_config(&state.config, "./config.toml").unwrap();
             Task::none()
         }
     }
@@ -611,7 +632,7 @@ fn view(state: &State) -> iced::Element<'_, Message> {
 
     let c = column!(
         row!(
-            button("Edit Config")
+            button("⚙")
                 .on_press(Message::ToggleConfig)
                 .height(state.config.text_height + state.config.padding)
                 .padding([0.0, state.config.padding]),
@@ -633,35 +654,45 @@ fn view(state: &State) -> iced::Element<'_, Message> {
         let c = column![
             float(
                 column!(
-                    iced::widget::combo_box(
-                        &state.config_editor.theme,
-                        "enter a theme",
-                        Some(&(&state.config.theme).try_into().unwrap()),
-                        Message::SetTheme,
+                    row!(
+                        iced::widget::text("Select Theme"),
+                        iced::widget::space().width(state.config.spacing),
+                        iced::widget::combo_box(
+                            &state.config_editor.theme,
+                            "Enter a theme",
+                            Some(&(&state.config.theme).try_into().unwrap()),
+                            Message::SetTheme,
+                        ),
+                        iced::widget::space().width(state.config.spacing),
+                        iced::widget::button("❌").on_press(Message::ToggleConfig)
                     ),
                     row!(
                         iced::widget::text("Spacing"),
+                        iced::widget::space().width(state.config.spacing),
                         iced::widget::slider(5.0..=50.0, state.config.spacing, Message::SetSpacing)
                     ),
                     row!(
                         iced::widget::text("Padding"),
+                        iced::widget::space().width(state.config.spacing),
                         iced::widget::slider(5.0..=50.0, state.config.padding, Message::SetPadding)
                     ),
                     row!(
                         iced::widget::text("Viewer Program"),
+                        iced::widget::space().width(state.config.spacing),
                         iced::widget::text_input(
                             "your favourite pdf viewer",
                             &state.config.viewer.program_name
                         )
-                        .on_input(Message::UpdateViewerProgram)
+                        .on_input(Message::SetViewerProgram)
                     ),
                     row!(
                         iced::widget::text("Viewer Page Argument"),
+                        iced::widget::space().width(state.config.spacing),
                         iced::widget::text_input(
                             "How to pass the page to open to your viewer",
                             &state.config.viewer.page_arg
                         )
-                        .on_input(Message::UpdateViewerPageArg)
+                        .on_input(Message::SetViewerPageArg)
                     )
                 )
                 .spacing(state.config.spacing),
@@ -949,6 +980,8 @@ fn main() -> iced::Result {
                         })
                     } else if key == Key::Character("o".into()) && modifiers.control() {
                         Some(Message::Open)
+                    } else if key == Key::Character("l".into()) && modifiers.control() {
+                        Some(Message::InitFocus)
                     } else {
                         None
                     }
