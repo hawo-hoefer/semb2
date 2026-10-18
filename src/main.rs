@@ -6,13 +6,16 @@ use std::time::SystemTime;
 
 use anyhow::Context;
 use candle_core::{DType, Tensor};
+use embed_anything::embeddings::local::colpali::get_images_from_pdf;
 use embed_anything::embeddings::local::colsmol::ColSmolEmbedder;
 use iced::Length::Fill;
 use iced::keyboard::Key;
+use iced::widget::image::Handle;
 use iced::widget::operation::AbsoluteOffset;
 use iced::widget::{combo_box, float};
 use iced::{Element, Subscription, Task, Theme, stream};
 use image::imageops::overlay;
+use image::{DynamicImage, GenericImageView};
 use serde::Serialize;
 use wincode::len::BincodeLen;
 
@@ -33,6 +36,20 @@ impl Paths {
 
 lazy_static::lazy_static! {
     pub static ref PATHS: Paths = Paths::new_or_die();
+}
+
+fn get_pdf_page(file_path: impl AsRef<Path>, page: u32) -> Result<DynamicImage, anyhow::Error> {
+    use pdf2image::PDF;
+    let pdf = PDF::from_file(file_path.as_ref())?;
+    // let page_count = pdf.page_count();
+    let mut pages = pdf.render(
+        pdf2image::Pages::Range(page..=page),
+        pdf2image::RenderOptionsBuilder::default()
+            .build()
+            .with_context(|| format!("render page {} of {}", page, file_path.as_ref().display()))?,
+    )?;
+    assert_eq!(pages.len(), 1);
+    Ok(pages.drain(..).nth(0).unwrap())
 }
 
 fn max_sim(query_embedding: &Tensor, document_embedding: &Tensor) -> Result<Tensor, anyhow::Error> {
@@ -131,6 +148,7 @@ fn load_model() -> ColSmolEmbedder {
     ret
 }
 
+#[derive(Clone)]
 struct QueryResult {
     path: String,
     page: usize,
@@ -165,6 +183,7 @@ struct State {
     config: Config,
     show_config: bool,
     config_editor: ConfigEditorState,
+    preview_cache: HashMap<(String, usize), iced::widget::image::Handle>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -349,6 +368,7 @@ struct Config {
     )]
     theme: Theme,
     root_paths: Vec<PathBuf>,
+    show_preview: bool,
 }
 
 impl Default for Config {
@@ -363,6 +383,7 @@ impl Default for Config {
             },
             theme: Theme::Light,
             root_paths: Vec::new(),
+            show_preview: true,
         }
     }
 }
@@ -386,6 +407,7 @@ enum Message {
     SetNewSearchPath(String),
     AddRootPath,
     RemoveSearchPath(usize),
+    ToggleShowPreview,
 }
 
 fn save_config(cfg: &Config) -> Result<(), anyhow::Error> {
@@ -450,6 +472,34 @@ fn save_embeddings(embeddings: &HashMap<String, DocData>) -> Result<(), anyhow::
         })
 }
 
+fn update_preview_cache(state: &mut State, path: String, page_number: usize) {
+    if !state
+        .preview_cache
+        .contains_key(&(path.clone(), page_number))
+    {
+        match get_pdf_page(&path, page_number as u32) {
+            Ok(page) => {
+                log::info!(
+                    "rendered page {page_number} of {path} with resolution {}x{}",
+                    page.width(),
+                    page.height()
+                );
+                state.preview_cache.insert(
+                    (path.clone(), page_number),
+                    Handle::from_rgba(page.width(), page.height(), page.to_rgba8().to_vec()),
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "Could not render image preview for page {} of {}: {err}",
+                    page_number,
+                    path
+                );
+            }
+        }
+    }
+}
+
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::InputChanged(s) => {
@@ -479,6 +529,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state
                 .results
                 .sort_by(|a, b| f32::total_cmp(&b.score, &a.score));
+
+            {
+                let result = &state.results[state.highlight_index];
+                update_preview_cache(state, result.path.clone(), result.page);
+            }
 
             iced::widget::operation::scroll_to(
                 "results",
@@ -536,6 +591,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.highlight_index =
                         (state.highlight_index as i64 - 1).rem_euclid(n_results as i64) as usize;
                 }
+
+                let result = &state.results[state.highlight_index];
+                update_preview_cache(state, result.path.clone(), result.page);
             }
             iced::widget::operation::scroll_to(
                 "results",
@@ -628,6 +686,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
             Task::none()
         }
+        Message::ToggleShowPreview => {
+            state.config.show_preview = !state.config.show_preview;
+            save_config(&state.config).unwrap();
+
+            Task::none()
+        }
     }
 }
 
@@ -686,15 +750,113 @@ fn centered_text<'a>(
     container(text(t).center().size(th).height(2.0 * padding + th)).into()
 }
 
+fn config_editor(state: &State) -> iced::Element<'_, Message> {
+    use iced::widget::{button, column, combo_box, row, slider, space, text, text_input};
+    let th = state.config.text_height;
+    let pad = state.config.padding;
+    let spc = state.config.spacing;
+    column!(
+        row!(
+            button(text("❌").center().size(th)).on_press(Message::ToggleConfig),
+            space().width(spc),
+            centered_text("Select Theme", pad, th),
+            space().width(spc),
+            combo_box(
+                &state.config_editor.theme,
+                "Enter a theme",
+                Some(&(&state.config.theme).try_into().unwrap()),
+                Message::SetTheme,
+            )
+            .size(th)
+        ),
+        row!(
+            centered_text("Text Size", pad, th),
+            space().width(spc),
+            slider(5.0..=50.0, th, Message::SetTextHeight)
+        ),
+        row!(
+            centered_text("Spacing", pad, th),
+            space().width(spc),
+            slider(5.0..=50.0, spc, Message::SetSpacing)
+        ),
+        row!(
+            centered_text("Padding", pad, th),
+            space().width(spc),
+            slider(5.0..=50.0, pad, Message::SetPadding)
+        ),
+        row!(
+            centered_text("Show Page Preview", pad, th),
+            space().width(spc),
+            iced::widget::checkbox(state.config.show_preview)
+                .on_toggle(|_| Message::ToggleShowPreview),
+        ),
+        iced::widget::rule::horizontal(spc / 4.0),
+        row!(
+            centered_text("Viewer Program", pad, th),
+            space().width(spc),
+            text_input(
+                "your favourite pdf viewer",
+                &state.config.viewer.program_name
+            )
+            .size(th)
+            .on_input(Message::SetViewerProgram)
+        ),
+        row!(
+            centered_text("Viewer Page Argument", pad, th),
+            space().width(state.config.spacing),
+            text_input(
+                "How to pass the page to open to your viewer",
+                &state.config.viewer.page_arg
+            )
+            .size(th)
+            .on_input(Message::SetViewerPageArg)
+        ),
+        iced::widget::rule::horizontal(spc / 4.0),
+        row!(
+            centered_text("Root Paths", pad, th),
+            space().width(state.config.spacing),
+            text_input("/path/to/documents/", &state.config_editor.new_seach_path)
+                .size(th)
+                .on_input(Message::SetNewSearchPath)
+                .on_submit(Message::AddRootPath),
+        ),
+        row!(column(state.config.root_paths.iter().enumerate().map(
+            |(i, p)| {
+                row!(
+                    space().width(spc * 4.0),
+                    button(text("❌").size(th).center()).on_press(Message::RemoveSearchPath(i)),
+                    space().width(spc),
+                    centered_text(p.to_string_lossy(), pad, th),
+                )
+                .into()
+            }
+        ))),
+        iced::widget::rule::horizontal(spc / 4.0),
+    )
+    .padding(pad)
+    .spacing(spc)
+    .into()
+}
+
 fn view(state: &State) -> iced::Element<'_, Message> {
     use iced::widget::{button, column, container, overlay, row, slider, space, text, text_input};
+    let Config {
+        text_height: th,
+        padding: pad,
+        spacing: spc,
+        viewer: _,
+        theme: _,
+        root_paths: _,
+        show_preview,
+    } = state.config;
+
     let ti = container(
         text_input("Enter Your Query", &state.query)
             .on_input(Message::InputChanged)
             .on_submit(Message::RunQuery)
             .id("query_widget"),
     )
-    .padding(state.config.padding);
+    .padding(pad);
 
     let in_queue = state.handles.file_request_tx.len();
     let loaded = state.loaded_files.len();
@@ -707,16 +869,7 @@ fn view(state: &State) -> iced::Element<'_, Message> {
         pb = pb.style(iced::widget::progress_bar::secondary);
     }
 
-    let Config {
-        text_height: th,
-        padding: pad,
-        spacing: spc,
-        viewer: _,
-        theme: _,
-        root_paths: _,
-    } = state.config;
-
-    let c = column!(
+    let mut c: Element<'_, Message> = column!(
         row!(
             button(text("⚙").center().size(th)).on_press(Message::ToggleConfig),
             space().width(spc),
@@ -736,93 +889,38 @@ fn view(state: &State) -> iced::Element<'_, Message> {
             .height(Fill)
             .padding([state.config.padding, 0.0])
     )
-    .padding(state.config.padding);
+    .padding(state.config.padding)
+    .into();
 
     if state.show_config {
-        let c = column![
-            float(
-                column!(
-                    row!(
-                        button(text("❌").center().size(th)).on_press(Message::ToggleConfig),
-                        space().width(spc),
-                        centered_text("Select Theme", pad, th),
-                        space().width(spc),
-                        combo_box(
-                            &state.config_editor.theme,
-                            "Enter a theme",
-                            Some(&(&state.config.theme).try_into().unwrap()),
-                            Message::SetTheme,
-                        )
-                        .size(state.config.text_height)
-                    ),
-                    row!(
-                        centered_text("Text Size", pad, th),
-                        space().width(spc),
-                        slider(5.0..=50.0, th, Message::SetTextHeight)
-                    ),
-                    row!(
-                        centered_text("Spacing", pad, th),
-                        space().width(spc),
-                        slider(5.0..=50.0, spc, Message::SetSpacing)
-                    ),
-                    row!(
-                        centered_text("Padding", pad, th),
-                        space().width(spc),
-                        slider(5.0..=50.0, pad, Message::SetPadding)
-                    ),
-                    iced::widget::rule::horizontal(spc / 4.0),
-                    row!(
-                        centered_text("Viewer Program", pad, th),
-                        space().width(spc),
-                        text_input(
-                            "your favourite pdf viewer",
-                            &state.config.viewer.program_name
-                        )
-                        .size(th)
-                        .on_input(Message::SetViewerProgram)
-                    ),
-                    row!(
-                        centered_text("Viewer Page Argument", pad, th),
-                        space().width(state.config.spacing),
-                        text_input(
-                            "How to pass the page to open to your viewer",
-                            &state.config.viewer.page_arg
-                        )
-                        .size(th)
-                        .on_input(Message::SetViewerPageArg)
-                    ),
-                    iced::widget::rule::horizontal(spc / 4.0),
-                    row!(
-                        centered_text("Root Paths", pad, th),
-                        space().width(state.config.spacing),
-                        text_input("/path/to/documents/", &state.config_editor.new_seach_path)
-                            .size(th)
-                            .on_input(Message::SetNewSearchPath)
-                            .on_submit(Message::AddRootPath),
-                    ),
-                    row!(column(state.config.root_paths.iter().enumerate().map(
-                        |(i, p)| {
-                            row!(
-                                space().width(spc * 4.0),
-                                button(text("❌").size(th).center())
-                                    .on_press(Message::RemoveSearchPath(i)),
-                                space().width(spc),
-                                centered_text(p.to_string_lossy(), pad, th),
-                            )
-                            .into()
-                        }
-                    ))),
-                    iced::widget::rule::horizontal(spc / 4.0),
-                )
-                .padding(state.config.padding)
-                .spacing(state.config.spacing),
-            ),
-            c
-        ];
-        return c.into();
+        let editor = config_editor(state);
+        c = column!(editor, c).into();
     }
 
-    c.into()
+    if state.config.show_preview && state.results.len() > 0 {
+        use iced::widget::Image;
+        let result = state.results[state.highlight_index].clone();
+        let img: Element<'_, Message> = state
+            .preview_cache
+            .get(&(result.path.clone(), result.page))
+            .map(|img| Image::new(img.clone()).expand(true).height(Fill).into())
+            .unwrap_or_else(|| {
+                text(format!(
+                    "could not load image for {} page {}",
+                    result.path, result.page,
+                ))
+                .into()
+            });
+
+        c = row!(
+            c,
+            iced::widget::rule::vertical(state.config.spacing / 4.0),
+            img
+        )
+        .into();
+    }
+
+    c
 }
 
 struct EmbedThread {
@@ -980,6 +1078,7 @@ fn new() -> State {
             ]),
             new_seach_path: "".to_string(),
         },
+        preview_cache: HashMap::new(),
     };
 
     for np in state.config.root_paths.clone().iter() {
