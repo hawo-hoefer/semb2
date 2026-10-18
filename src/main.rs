@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::Context;
@@ -15,6 +15,25 @@ use iced::{Element, Subscription, Task, Theme, stream};
 use image::imageops::overlay;
 use serde::Serialize;
 use wincode::len::BincodeLen;
+
+pub struct Paths {
+    pub config_path: PathBuf,
+    pub embedding_cache_path: PathBuf,
+}
+
+impl Paths {
+    pub fn new_or_die() -> Paths {
+        let pd = directories::ProjectDirs::from("", "", "semb2").unwrap();
+        Paths {
+            config_path: pd.config_dir().to_path_buf().join("config.toml"),
+            embedding_cache_path: pd.cache_dir().to_path_buf().join("embeddings.bin"),
+        }
+    }
+}
+
+lazy_static::lazy_static! {
+    pub static ref PATHS: Paths = Paths::new_or_die();
+}
 
 fn max_sim(query_embedding: &Tensor, document_embedding: &Tensor) -> Result<Tensor, anyhow::Error> {
     const DOC_DIM: usize = 2;
@@ -39,8 +58,10 @@ fn embed_file(
         // let start_page = index * batch_size + 1;
         // let end_page = start_page + batch.len();
         // let page_numbers = (start_page..=end_page).collect::<Vec<_>>();
-        let (input_ids, attention_mask, pixel_values, pixel_attention_mask) =
-            embedder.processor.preprocess(batch, &embedder.device)?;
+        let (input_ids, attention_mask, pixel_values, pixel_attention_mask) = embedder
+            .processor
+            .preprocess(batch, &embedder.device)
+            .context("error in preprocessing")?;
 
         let image_embeddings = embedder
             .model
@@ -51,7 +72,8 @@ fn embed_file(
                 &attention_mask,
                 &Some(pixel_values),
                 &pixel_attention_mask,
-            )?
+            )
+            .context("Error in running model")?
             .to_dtype(DType::F32)?;
         embed_data.push(image_embeddings);
     }
@@ -128,6 +150,7 @@ enum EmbedResult {
 
 struct ConfigEditorState {
     theme: combo_box::State<_Theme>,
+    new_seach_path: String,
 }
 
 struct State {
@@ -325,6 +348,7 @@ struct Config {
         serialize_with = "serialize_theme_name"
     )]
     theme: Theme,
+    root_paths: Vec<PathBuf>,
 }
 
 impl Default for Config {
@@ -338,6 +362,7 @@ impl Default for Config {
                 page_arg: "--page".to_string(),
             },
             theme: Theme::Light,
+            root_paths: Vec::new(),
         }
     }
 }
@@ -357,12 +382,18 @@ enum Message {
     SetPadding(f32),
     SetViewerProgram(String),
     SetViewerPageArg(String),
+    SetNewSearchPath(String),
+    AddRootPath,
+    RemoveSearchPath(usize),
 }
 
-fn save_config(cfg: &Config, to: impl AsRef<std::path::Path>) -> Result<(), anyhow::Error> {
+fn save_config(cfg: &Config) -> Result<(), anyhow::Error> {
     let serialized = toml::to_string_pretty(cfg).context("serialize config")?;
+    use std::io::Write;
 
-    std::fs::File::create(to.as_ref())
+    let to = &PATHS.config_path;
+    std::fs::create_dir_all(to.parent().expect("is file"))?;
+    std::fs::File::create(to)
         .map_err(anyhow::Error::new)
         .context("(re-)create config file")
         .map(BufWriter::new)
@@ -373,6 +404,49 @@ fn save_config(cfg: &Config, to: impl AsRef<std::path::Path>) -> Result<(), anyh
         })?;
 
     Ok(())
+}
+
+fn save_embeddings(embeddings: &HashMap<String, DocData>) -> Result<(), anyhow::Error> {
+    std::fs::create_dir_all(&PATHS.embedding_cache_path.parent().expect("is file"))?;
+    std::fs::File::create(&PATHS.embedding_cache_path)
+        .map_err(anyhow::Error::new)
+        .map(BufWriter::new)
+        .and_then(|mut x| {
+            x.write_all(
+                &wincode::serialize(
+                    &embeddings
+                        .iter()
+                        .map(
+                            |(
+                                file,
+                                DocData {
+                                    last_mtime,
+                                    page_embeddings,
+                                },
+                            )| {
+                                (
+                                    file,
+                                    SavedDocData {
+                                        last_mtime: last_mtime.clone(),
+                                        page_embedding_shape: page_embeddings
+                                            .shape()
+                                            .clone()
+                                            .into_dims(),
+                                        page_embeddings: page_embeddings
+                                            .flatten_all()
+                                            .unwrap()
+                                            .to_vec1()
+                                            .unwrap(),
+                                    },
+                                )
+                            },
+                        )
+                        .collect::<HashMap<_, _>>(),
+                )
+                .context("Serialization")?,
+            )
+            .context("Write embeddings to file")
+        })
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
@@ -438,50 +512,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::DocumentProcessed(path, doc_data) => {
             log::info!("Finished processing {path}");
             state.loaded_files.insert(path, doc_data);
-            let save_path = std::path::PathBuf::from("./embeddings.bin");
-            use std::io::Write;
-
-            std::fs::File::create(save_path)
-                .map_err(anyhow::Error::new)
-                .map(BufWriter::new)
-                .and_then(|mut x| {
-                    x.write_all(
-                        &wincode::serialize(
-                            &state
-                                .loaded_files
-                                .iter()
-                                .map(
-                                    |(
-                                        file,
-                                        DocData {
-                                            last_mtime,
-                                            page_embeddings,
-                                        },
-                                    )| {
-                                        (
-                                            file,
-                                            SavedDocData {
-                                                last_mtime: last_mtime.clone(),
-                                                page_embedding_shape: page_embeddings
-                                                    .shape()
-                                                    .clone()
-                                                    .into_dims(),
-                                                page_embeddings: page_embeddings
-                                                    .flatten_all()
-                                                    .unwrap()
-                                                    .to_vec1()
-                                                    .unwrap(),
-                                            },
-                                        )
-                                    },
-                                )
-                                .collect::<HashMap<_, _>>(),
-                        )
-                        .context("Serialization")?,
-                    )
-                    .context("Write embeddings to file")
-                })
-                .unwrap();
+            save_embeddings(&state.loaded_files).unwrap_or_else(|err| {
+                log::error!(
+                    "Could not save embeddings to {}: {err}",
+                    PATHS.embedding_cache_path.display()
+                );
+            });
 
             Task::none()
         }
@@ -540,27 +576,49 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::SetTheme(_theme) => {
             state.config.theme = _theme.into();
-            save_config(&state.config, "./config.toml").unwrap();
+            save_config(&state.config).unwrap();
             Task::none()
         }
         Message::SetSpacing(spacing) => {
             state.config.spacing = spacing;
-            save_config(&state.config, "./config.toml").unwrap();
+            save_config(&state.config).unwrap();
             Task::none()
         }
         Message::SetPadding(padding) => {
             state.config.padding = padding;
-            save_config(&state.config, "./config.toml").unwrap();
+            save_config(&state.config).unwrap();
             Task::none()
         }
         Message::SetViewerProgram(program) => {
             state.config.viewer.program_name = program;
-            save_config(&state.config, "./config.toml").unwrap();
+            save_config(&state.config).unwrap();
             Task::none()
         }
         Message::SetViewerPageArg(arg) => {
             state.config.viewer.page_arg = arg;
-            save_config(&state.config, "./config.toml").unwrap();
+            save_config(&state.config).unwrap();
+            Task::none()
+        }
+        Message::RemoveSearchPath(idx) => {
+            let root = state.config.root_paths.remove(idx);
+            state.loaded_files = state
+                .loaded_files
+                .drain()
+                .filter(|(path, _data)| !PathBuf::from(path).starts_with(&root))
+                .collect();
+            Task::none()
+        }
+        Message::AddRootPath => {
+            let mut new_path = String::new();
+            std::mem::swap(&mut new_path, &mut state.config_editor.new_seach_path);
+            locate_documents(state, &new_path);
+            state.config.root_paths.push(new_path.into());
+            save_config(&state.config).unwrap();
+
+            Task::none()
+        }
+        Message::SetNewSearchPath(path) => {
+            state.config_editor.new_seach_path = path;
             Task::none()
         }
     }
@@ -613,7 +671,7 @@ fn theme(s: &State) -> iced::Theme {
 }
 
 fn view(state: &State) -> iced::Element<'_, Message> {
-    use iced::widget::{button, column, container, overlay, row, text_input};
+    use iced::widget::{button, column, container, overlay, row, slider, space, text, text_input};
     let ti = text_input("Enter Your Query", &state.query)
         .on_input(Message::InputChanged)
         .on_submit(Message::RunQuery)
@@ -632,14 +690,16 @@ fn view(state: &State) -> iced::Element<'_, Message> {
 
     let c = column!(
         row!(
-            button("⚙")
+            button(iced::widget::text("⚙").center())
                 .on_press(Message::ToggleConfig)
                 .height(state.config.text_height + state.config.padding)
                 .padding([0.0, state.config.padding]),
-            iced::widget::space().width(state.config.spacing),
+            space().width(state.config.spacing),
             container(pb)
                 .height(state.config.text_height + state.config.padding)
-                .center_y(state.config.text_height + state.config.padding)
+                .center_y(state.config.text_height + state.config.padding),
+            space().width(state.config.spacing),
+            text(format!("Loaded {} documents", state.loaded_files.len()))
         )
         .padding([state.config.padding, 0.0]),
         ti,
@@ -655,46 +715,63 @@ fn view(state: &State) -> iced::Element<'_, Message> {
             float(
                 column!(
                     row!(
-                        iced::widget::text("Select Theme"),
-                        iced::widget::space().width(state.config.spacing),
-                        iced::widget::combo_box(
+                        button("❌").on_press(Message::ToggleConfig),
+                        space().width(state.config.spacing),
+                        text("Select Theme"),
+                        space().width(state.config.spacing),
+                        combo_box(
                             &state.config_editor.theme,
                             "Enter a theme",
                             Some(&(&state.config.theme).try_into().unwrap()),
                             Message::SetTheme,
                         ),
-                        iced::widget::space().width(state.config.spacing),
-                        iced::widget::button("❌").on_press(Message::ToggleConfig)
                     ),
                     row!(
-                        iced::widget::text("Spacing"),
-                        iced::widget::space().width(state.config.spacing),
-                        iced::widget::slider(5.0..=50.0, state.config.spacing, Message::SetSpacing)
+                        text("Spacing"),
+                        space().width(state.config.spacing),
+                        slider(5.0..=50.0, state.config.spacing, Message::SetSpacing)
                     ),
                     row!(
-                        iced::widget::text("Padding"),
-                        iced::widget::space().width(state.config.spacing),
-                        iced::widget::slider(5.0..=50.0, state.config.padding, Message::SetPadding)
+                        text("Padding"),
+                        space().width(state.config.spacing),
+                        slider(5.0..=50.0, state.config.padding, Message::SetPadding)
                     ),
                     row!(
-                        iced::widget::text("Viewer Program"),
-                        iced::widget::space().width(state.config.spacing),
-                        iced::widget::text_input(
+                        text("Viewer Program"),
+                        space().width(state.config.spacing),
+                        text_input(
                             "your favourite pdf viewer",
                             &state.config.viewer.program_name
                         )
                         .on_input(Message::SetViewerProgram)
                     ),
                     row!(
-                        iced::widget::text("Viewer Page Argument"),
-                        iced::widget::space().width(state.config.spacing),
-                        iced::widget::text_input(
+                        text("Viewer Page Argument"),
+                        space().width(state.config.spacing),
+                        text_input(
                             "How to pass the page to open to your viewer",
                             &state.config.viewer.page_arg
                         )
                         .on_input(Message::SetViewerPageArg)
-                    )
+                    ),
+                    row!(
+                        text("Root Paths"),
+                        space().width(state.config.spacing),
+                        text_input("/path/to/documents/", &state.config_editor.new_seach_path)
+                            .on_input(Message::SetNewSearchPath)
+                            .on_submit(Message::AddRootPath),
+                    ),
+                    row!(column(state.config.root_paths.iter().enumerate().map(
+                        |(i, p)| {
+                            row!(
+                                text(p.to_string_lossy()),
+                                button("❌").on_press(Message::RemoveSearchPath(i))
+                            )
+                            .into()
+                        }
+                    )))
                 )
+                .padding(state.config.padding)
                 .spacing(state.config.spacing),
             ),
             c // c.into()
@@ -768,7 +845,7 @@ fn embed_thread(et: EmbedThread) {
                 };
                 log::info!("Received embedding request for query {query}");
                 let embedded = embed_query(&et.model, &query).and_then(normalize).unwrap();
-                et.query_embedding_tx.send((query, embedded)).unwrap();
+                et.query_embedding_tx.send((query, embedded.to_device(&candle_core::Device::Cpu).unwrap())).unwrap();
             }
             recv(et.file_request_rx) -> path => {
                 let path = match path {
@@ -787,10 +864,14 @@ fn embed_thread(et: EmbedThread) {
                 let meta = std::fs::metadata(&path).unwrap();
                 let modified = meta.modified().unwrap();
 
-                let embedded = embed_file(&et.model, path.clone(), 3)
-                    .and_then(normalize)
-                    .unwrap();
-                et.file_embedding_tx.send((path.to_string_lossy().to_string(), DocData { last_mtime: modified, page_embeddings: embedded })).unwrap();
+                let embedded = match embed_file(&et.model, path.clone(), 1).and_then(normalize) {
+                    Ok(embedded) => embedded,
+                    Err(e) => {
+                        log::error!("Could not embed file {}. If there is a size mismatch, this is likely due to varying page sizes. Error: {e}", path.display());
+                        continue
+                    },
+                };
+                et.file_embedding_tx.send((path.to_string_lossy().to_string(), DocData { last_mtime: modified, page_embeddings: embedded.to_device(&candle_core::Device::Cpu).unwrap() })).unwrap();
             }
         }
     }
@@ -801,10 +882,11 @@ fn new() -> State {
     let embed_model = load_model();
 
     let device = embed_model.device.clone();
-    let loaded_files =
-        load_saved_embeddings(&std::path::PathBuf::from("./embeddings.bin"), &device);
-    let cfg_path = std::path::PathBuf::from("./config.toml");
-    let config: Config = std::fs::File::open(cfg_path)
+    let loaded_files = load_saved_embeddings(
+        &std::path::PathBuf::from(&PATHS.embedding_cache_path),
+        &device,
+    );
+    let config: Config = std::fs::File::open(&PATHS.config_path)
         .map_err(|x| anyhow::Error::new(x).context("open config file"))
         .map(BufReader::new)
         .and_then(|mut x| {
@@ -817,42 +899,7 @@ fn new() -> State {
     let (et, handles) = EmbedThread::create(embed_model);
     std::thread::spawn(|| embed_thread(et));
 
-    for f in walkdir::WalkDir::new("/home/hawo/notes")
-        .into_iter()
-        .filter_map(|f| {
-            match f {
-                Ok(f)
-                    if f.file_name()
-                        .to_str()
-                        .expect("should be convertible to str")
-                        .ends_with(".pdf") =>
-                {
-                    Some(f.into_path())
-                }
-                Ok(_) => {
-                    // not a pdf
-                    None
-                }
-                Err(e) => {
-                    log::warn!("Could not load file: {e}");
-                    None
-                }
-            }
-        })
-    {
-        let meta = std::fs::metadata(&f).unwrap();
-        let modified = meta.modified().unwrap();
-        let key = f.to_string_lossy().to_string();
-
-        if loaded_files.contains_key(&key) && loaded_files[&key].last_mtime >= modified {
-            log::info!("Skipping {key}. Already embedded before");
-        } else {
-            log::info!("Queuing embedding of {key}");
-            handles.file_request_tx.send(f).unwrap();
-        }
-    }
-
-    State {
+    let mut state = State {
         query: String::new(),
         results: Vec::new(),
         loaded_files: loaded_files,
@@ -888,7 +935,49 @@ fn new() -> State {
                 _Theme::Oxocarbon,
                 _Theme::Ferra,
             ]),
+            new_seach_path: "".to_string(),
         },
+    };
+
+    for np in state.config.root_paths.clone().iter() {
+        locate_documents(&mut state, np);
+    }
+
+    state
+}
+
+fn locate_documents(state: &mut State, root: impl AsRef<Path>) {
+    for f in walkdir::WalkDir::new(root).into_iter().filter_map(|f| {
+        match f {
+            Ok(f)
+                if f.file_name()
+                    .to_str()
+                    .expect("should be convertible to str")
+                    .ends_with(".pdf") =>
+            {
+                Some(f.into_path())
+            }
+            Ok(_) => {
+                // not a pdf
+                None
+            }
+            Err(e) => {
+                log::warn!("Could not load file: {e}");
+                None
+            }
+        }
+    }) {
+        let meta = std::fs::metadata(&f).unwrap();
+        let modified = meta.modified().unwrap();
+        let key = f.to_string_lossy().to_string();
+
+        if state.loaded_files.contains_key(&key) && state.loaded_files[&key].last_mtime >= modified
+        {
+            log::info!("Skipping {key}. Already embedded before");
+        } else {
+            log::info!("Queuing embedding of {key}");
+            state.handles.file_request_tx.send(f).unwrap();
+        }
     }
 }
 
@@ -936,7 +1025,7 @@ fn load_saved_embeddings(
 
 fn init_focus() -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::SinkExt;
-    stream::channel(1, async |mut output| {
+    stream::channel(100, async |mut output| {
         output.send(Message::InitFocus).await;
     })
 }
@@ -970,10 +1059,9 @@ fn main() -> iced::Result {
                     physical_key: _,
                     location: _,
                     modifiers,
-                    text,
+                    text: _,
                     repeat: _,
                 } => {
-                    dbg!(key == Key::Character("o".into()), modifiers.control());
                     if key == Key::Named(iced::keyboard::key::Named::Tab) {
                         Some(Message::MoveHighlight {
                             down: !modifiers.shift(),
