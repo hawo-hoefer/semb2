@@ -10,7 +10,9 @@ use embed_anything::embeddings::local::colsmol::ColSmolEmbedder;
 use iced::Length::Fill;
 use iced::keyboard::Key;
 use iced::widget::operation::AbsoluteOffset;
+use iced::widget::{combo_box, float};
 use iced::{Element, Subscription, Task, Theme, stream};
+use image::imageops::overlay;
 use serde::Serialize;
 use wincode::len::BincodeLen;
 
@@ -124,6 +126,10 @@ enum EmbedResult {
     Query(Tensor),
 }
 
+struct ConfigEditorState {
+    theme: combo_box::State<_Theme>,
+}
+
 struct State {
     handles: EmbedHandles,
     query: String,
@@ -134,6 +140,8 @@ struct State {
     device: candle_core::Device,
     highlight_index: usize,
     config: Config,
+    show_config: bool,
+    config_editor: ConfigEditorState,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -142,7 +150,7 @@ struct Viewer {
     page_arg: String,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 enum _Theme {
     Light,
     Dark,
@@ -168,36 +176,107 @@ enum _Theme {
     Ferra,
 }
 
+impl std::fmt::Display for _Theme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use _Theme::*;
+        let theme = match self {
+            Light => "Light",
+            Dark => "Dark",
+            Dracula => "Dracula",
+            Nord => "Nord",
+            SolarizedLight => "SolarizedLight",
+            SolarizedDark => "SolarizedDark",
+            GruvboxLight => "GruvboxLight",
+            GruvboxDark => "GruvboxDark",
+            CatppuccinLatte => "CatppuccinLatte",
+            CatppuccinFrappe => "CatppuccinFrappe",
+            CatppuccinMacchiato => "CatppuccinMacchiato",
+            CatppuccinMocha => "CatppuccinMocha",
+            TokyoNight => "TokyoNight",
+            TokyoNightStorm => "TokyoNightStorm",
+            TokyoNightLight => "TokyoNightLight",
+            KanagawaWave => "KanagawaWave",
+            KanagawaDragon => "KanagawaDragon",
+            KanagawaLotus => "KanagawaLotus",
+            Moonfly => "Moonfly",
+            Nightfly => "Nightfly",
+            Oxocarbon => "Oxocarbon",
+            Ferra => "Ferra",
+        };
+        f.write_str(theme)
+    }
+}
+
+impl TryFrom<&Theme> for _Theme {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &Theme) -> Result<Self, Self::Error> {
+        let t = match value {
+            Theme::Light => _Theme::Light,
+            Theme::Dark => _Theme::Dark,
+            Theme::Dracula => _Theme::Dracula,
+            Theme::Nord => _Theme::Nord,
+            Theme::SolarizedLight => _Theme::SolarizedLight,
+            Theme::SolarizedDark => _Theme::SolarizedDark,
+            Theme::GruvboxLight => _Theme::GruvboxLight,
+            Theme::GruvboxDark => _Theme::GruvboxDark,
+            Theme::CatppuccinLatte => _Theme::CatppuccinLatte,
+            Theme::CatppuccinFrappe => _Theme::CatppuccinFrappe,
+            Theme::CatppuccinMacchiato => _Theme::CatppuccinMacchiato,
+            Theme::CatppuccinMocha => _Theme::CatppuccinMocha,
+            Theme::TokyoNight => _Theme::TokyoNight,
+            Theme::TokyoNightStorm => _Theme::TokyoNightStorm,
+            Theme::TokyoNightLight => _Theme::TokyoNightLight,
+            Theme::KanagawaWave => _Theme::KanagawaWave,
+            Theme::KanagawaDragon => _Theme::KanagawaDragon,
+            Theme::KanagawaLotus => _Theme::KanagawaLotus,
+            Theme::Moonfly => _Theme::Moonfly,
+            Theme::Nightfly => _Theme::Nightfly,
+            Theme::Oxocarbon => _Theme::Oxocarbon,
+            Theme::Ferra => _Theme::Ferra,
+            Theme::Custom(_) => anyhow::bail!("custom theme cannot be converted to savable theme"),
+        };
+
+        Ok(t)
+    }
+}
+
+impl Into<Theme> for _Theme {
+    fn into(self) -> Theme {
+        match self {
+            _Theme::Light => Theme::Light,
+            _Theme::Dark => Theme::Dark,
+            _Theme::Dracula => Theme::Dracula,
+            _Theme::Nord => Theme::Nord,
+            _Theme::SolarizedLight => Theme::SolarizedLight,
+            _Theme::SolarizedDark => Theme::SolarizedDark,
+            _Theme::GruvboxLight => Theme::GruvboxLight,
+            _Theme::GruvboxDark => Theme::GruvboxDark,
+            _Theme::CatppuccinLatte => Theme::CatppuccinLatte,
+            _Theme::CatppuccinFrappe => Theme::CatppuccinFrappe,
+            _Theme::CatppuccinMacchiato => Theme::CatppuccinMacchiato,
+            _Theme::CatppuccinMocha => Theme::CatppuccinMocha,
+            _Theme::TokyoNight => Theme::TokyoNight,
+            _Theme::TokyoNightStorm => Theme::TokyoNightStorm,
+            _Theme::TokyoNightLight => Theme::TokyoNightLight,
+            _Theme::KanagawaWave => Theme::KanagawaWave,
+            _Theme::KanagawaDragon => Theme::KanagawaDragon,
+            _Theme::KanagawaLotus => Theme::KanagawaLotus,
+            _Theme::Moonfly => Theme::Moonfly,
+            _Theme::Nightfly => Theme::Nightfly,
+            _Theme::Oxocarbon => Theme::Oxocarbon,
+            _Theme::Ferra => Theme::Ferra,
+        }
+    }
+}
+
 fn deserialize_theme_name<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Theme, <D as serde::Deserializer<'de>>::Error> {
     use serde::Deserialize;
 
     let theme = _Theme::deserialize(d)?;
-    Ok(match theme {
-        _Theme::Light => Theme::Light,
-        _Theme::Dark => Theme::Dark,
-        _Theme::Dracula => Theme::Dracula,
-        _Theme::Nord => Theme::Nord,
-        _Theme::SolarizedLight => Theme::SolarizedLight,
-        _Theme::SolarizedDark => Theme::SolarizedDark,
-        _Theme::GruvboxLight => Theme::GruvboxLight,
-        _Theme::GruvboxDark => Theme::GruvboxDark,
-        _Theme::CatppuccinLatte => Theme::CatppuccinLatte,
-        _Theme::CatppuccinFrappe => Theme::CatppuccinFrappe,
-        _Theme::CatppuccinMacchiato => Theme::CatppuccinMacchiato,
-        _Theme::CatppuccinMocha => Theme::CatppuccinMocha,
-        _Theme::TokyoNight => Theme::TokyoNight,
-        _Theme::TokyoNightStorm => Theme::TokyoNightStorm,
-        _Theme::TokyoNightLight => Theme::TokyoNightLight,
-        _Theme::KanagawaWave => Theme::KanagawaWave,
-        _Theme::KanagawaDragon => Theme::KanagawaDragon,
-        _Theme::KanagawaLotus => Theme::KanagawaLotus,
-        _Theme::Moonfly => Theme::Moonfly,
-        _Theme::Nightfly => Theme::Nightfly,
-        _Theme::Oxocarbon => Theme::Oxocarbon,
-        _Theme::Ferra => Theme::Ferra,
-    })
+    Ok(theme.into())
 }
 
 fn serialize_theme_name<S: serde::Serializer>(
@@ -270,8 +349,14 @@ enum Message {
     QueryProcessed(String, Tensor),
     DocumentProcessed(String, DocData),
     InitFocus,
+    ToggleConfig,
     Open,
     MoveHighlight { down: bool },
+    SetTheme(_Theme),
+    SetSpacing(f32),
+    SetPadding(f32),
+    UpdateViewerProgram(String),
+    UpdateViewerPageArg(String),
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
@@ -405,9 +490,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     x: None,
                     y: Some(
                         state.highlight_index as f32
-                            * (state.config.text_height
-                                + state.config.padding
-                                + state.config.spacing),
+                            * (state.config.text_height + state.config.padding),
                     ),
                 },
             )
@@ -435,6 +518,30 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
             Task::none()
         }
+        Message::ToggleConfig => {
+            state.show_config = !state.show_config;
+            Task::none()
+        }
+        Message::SetTheme(_theme) => {
+            state.config.theme = _theme.into();
+            Task::none()
+        }
+        Message::SetSpacing(spacing) => {
+            state.config.spacing = spacing;
+            Task::none()
+        }
+        Message::SetPadding(padding) => {
+            state.config.padding = padding;
+            Task::none()
+        }
+        Message::UpdateViewerProgram(program) => {
+            state.config.viewer.program_name = program;
+            Task::none()
+        }
+        Message::UpdateViewerPageArg(arg) => {
+            state.config.viewer.page_arg = arg;
+            Task::none()
+        }
     }
 }
 
@@ -444,32 +551,35 @@ fn results(state: &State) -> Element<'_, Message> {
     let palette = state.config.theme.palette();
 
     container(
-        scrollable(column(
-            state
-                .results
-                .iter()
-                .enumerate()
-                .map(|(i, QueryResult { path, page, score })| {
-                    let fg = if i == state.highlight_index {
-                        palette.success
-                    } else {
-                        palette.text
-                    };
+        scrollable(
+            column(
+                state
+                    .results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, QueryResult { path, page, score })| {
+                        let fg = if i == state.highlight_index {
+                            palette.success
+                        } else {
+                            palette.text
+                        };
 
-                    container(
-                        rich_text([span(format!("{score:.3} {path} | {page}\n")).color(fg)])
-                            .on_link_click(iced::never)
-                            .size(state.config.text_height),
-                    )
-                    .width(Fill)
-                    .center_y(Fill)
-                    .padding(state.config.padding)
-                    .style(container::rounded_box)
-                    .id(format!("result-{i}"))
-                    .into()
-                })
-                .collect::<Vec<_>>(),
-        ))
+                        container(
+                            rich_text([span(format!("{score:.3} {path} | {page}\n")).color(fg)])
+                                .on_link_click(iced::never)
+                                .size(state.config.text_height),
+                        )
+                        .width(Fill)
+                        .center_y(Fill)
+                        .padding(state.config.padding)
+                        .style(container::rounded_box)
+                        .id(format!("result-{i}"))
+                        .into()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .spacing(state.config.spacing),
+        )
         .id("results"),
     )
     .padding(state.config.padding)
@@ -482,7 +592,7 @@ fn theme(s: &State) -> iced::Theme {
 }
 
 fn view(state: &State) -> iced::Element<'_, Message> {
-    use iced::widget::{column, container, text_input};
+    use iced::widget::{button, column, container, overlay, row, text_input};
     let ti = text_input("Enter Your Query", &state.query)
         .on_input(Message::InputChanged)
         .on_submit(Message::RunQuery)
@@ -491,21 +601,77 @@ fn view(state: &State) -> iced::Element<'_, Message> {
     let in_queue = state.handles.file_request_tx.len();
     let loaded = state.loaded_files.len();
     let total = in_queue + loaded;
+    let mut pb = iced::widget::progress_bar(0.0..=total as f32, loaded as f32)
+        .girth(state.config.text_height);
+    if loaded == total {
+        pb = pb.style(iced::widget::progress_bar::success);
+    } else {
+        pb = pb.style(iced::widget::progress_bar::secondary);
+    }
 
-    container(
-        column!(
-            container(iced::widget::progress_bar(0.0..=total as f32, loaded as f32).girth(10))
-                .padding([state.config.padding, 0.0]),
-            ti,
-            container(results(state))
-                .width(Fill)
-                .height(Fill)
-                .padding([state.config.padding, 0.0])
+    let c = column!(
+        row!(
+            button("Edit Config")
+                .on_press(Message::ToggleConfig)
+                .height(state.config.text_height + state.config.padding)
+                .padding([0.0, state.config.padding]),
+            iced::widget::space().width(state.config.spacing),
+            container(pb)
+                .height(state.config.text_height + state.config.padding)
+                .center_y(state.config.text_height + state.config.padding)
         )
-        .spacing(state.config.spacing),
+        .padding([state.config.padding, 0.0]),
+        ti,
+        container(results(state))
+            .width(Fill)
+            .height(Fill)
+            .padding([state.config.padding, 0.0])
     )
-    .padding(state.config.padding)
-    .into()
+    .padding(state.config.padding);
+
+    if state.show_config {
+        let c = column![
+            float(
+                column!(
+                    iced::widget::combo_box(
+                        &state.config_editor.theme,
+                        "enter a theme",
+                        Some(&(&state.config.theme).try_into().unwrap()),
+                        Message::SetTheme,
+                    ),
+                    row!(
+                        iced::widget::text("Spacing"),
+                        iced::widget::slider(5.0..=50.0, state.config.spacing, Message::SetSpacing)
+                    ),
+                    row!(
+                        iced::widget::text("Padding"),
+                        iced::widget::slider(5.0..=50.0, state.config.padding, Message::SetPadding)
+                    ),
+                    row!(
+                        iced::widget::text("Viewer Program"),
+                        iced::widget::text_input(
+                            "your favourite pdf viewer",
+                            &state.config.viewer.program_name
+                        )
+                        .on_input(Message::UpdateViewerProgram)
+                    ),
+                    row!(
+                        iced::widget::text("Viewer Page Argument"),
+                        iced::widget::text_input(
+                            "How to pass the page to open to your viewer",
+                            &state.config.viewer.page_arg
+                        )
+                        .on_input(Message::UpdateViewerPageArg)
+                    )
+                )
+                .spacing(state.config.spacing),
+            ),
+            c // c.into()
+        ];
+        return c.into();
+    }
+
+    c.into()
 }
 
 struct EmbedThread {
@@ -665,6 +831,33 @@ fn new() -> State {
         highlight_index: 0,
         config,
         last_query: String::from(""),
+        show_config: false,
+        config_editor: ConfigEditorState {
+            theme: combo_box::State::new(vec![
+                _Theme::Light,
+                _Theme::Dark,
+                _Theme::Dracula,
+                _Theme::Nord,
+                _Theme::SolarizedLight,
+                _Theme::SolarizedDark,
+                _Theme::GruvboxLight,
+                _Theme::GruvboxDark,
+                _Theme::CatppuccinLatte,
+                _Theme::CatppuccinFrappe,
+                _Theme::CatppuccinMacchiato,
+                _Theme::CatppuccinMocha,
+                _Theme::TokyoNight,
+                _Theme::TokyoNightStorm,
+                _Theme::TokyoNightLight,
+                _Theme::KanagawaWave,
+                _Theme::KanagawaDragon,
+                _Theme::KanagawaLotus,
+                _Theme::Moonfly,
+                _Theme::Nightfly,
+                _Theme::Oxocarbon,
+                _Theme::Ferra,
+            ]),
+        },
     }
 }
 
