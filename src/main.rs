@@ -545,6 +545,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::RunQuery => {
             if state.query == state.last_query {
+                log::info!("Opening After 2x RunQuery");
                 Task::done(Message::Open)
             } else {
                 state
