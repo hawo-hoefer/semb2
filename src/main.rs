@@ -564,7 +564,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     ])
                     .spawn()
                 {
-                    Ok(ok) => (),
+                    Ok(_) => return iced::exit(),
                     Err(err) => log::error!("Could not spawn viewer: {err}"),
                 }
             }
@@ -1129,5 +1129,24 @@ fn main() -> iced::Result {
             Subscription::batch(subscriptions)
         })
         .theme(theme)
+        .centered()
+        .window(iced::window::Settings {
+            size: (1200f32, 600f32).into(),
+            maximized: false,
+            fullscreen: false,
+            position: iced::window::Position::Centered,
+            min_size: Some((800f32, 600f32).into()),
+            max_size: None,
+            visible: true,
+            resizable: true,
+            closeable: true,
+            minimizable: false,
+            decorations: true,
+            transparent: false,
+            blur: false,
+            level: iced::window::Level::AlwaysOnTop,
+            ..Default::default()
+        })
+        .title("semb2")
         .run()
 }
