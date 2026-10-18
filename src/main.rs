@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::io::{BufWriter, Read};
+use std::io::{BufReader, BufWriter, Read};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -10,7 +10,8 @@ use embed_anything::embeddings::local::colsmol::ColSmolEmbedder;
 use iced::Length::Fill;
 use iced::keyboard::Key;
 use iced::widget::operation::AbsoluteOffset;
-use iced::{Element, Subscription, Task, stream};
+use iced::{Element, Subscription, Task, Theme, stream};
+use serde::Serialize;
 use wincode::len::BincodeLen;
 
 fn max_sim(query_embedding: &Tensor, document_embedding: &Tensor) -> Result<Tensor, anyhow::Error> {
@@ -132,20 +133,134 @@ struct State {
     init_focus: bool,
     device: candle_core::Device,
     highlight_index: usize,
-    theme: iced::theme::Theme,
     config: Config,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
 struct Viewer {
     program_name: String,
     page_arg: String,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+enum _Theme {
+    Light,
+    Dark,
+    Dracula,
+    Nord,
+    SolarizedLight,
+    SolarizedDark,
+    GruvboxLight,
+    GruvboxDark,
+    CatppuccinLatte,
+    CatppuccinFrappe,
+    CatppuccinMacchiato,
+    CatppuccinMocha,
+    TokyoNight,
+    TokyoNightStorm,
+    TokyoNightLight,
+    KanagawaWave,
+    KanagawaDragon,
+    KanagawaLotus,
+    Moonfly,
+    Nightfly,
+    Oxocarbon,
+    Ferra,
+}
+
+fn deserialize_theme_name<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Theme, <D as serde::Deserializer<'de>>::Error> {
+    use serde::Deserialize;
+
+    let theme = _Theme::deserialize(d)?;
+    Ok(match theme {
+        _Theme::Light => Theme::Light,
+        _Theme::Dark => Theme::Dark,
+        _Theme::Dracula => Theme::Dracula,
+        _Theme::Nord => Theme::Nord,
+        _Theme::SolarizedLight => Theme::SolarizedLight,
+        _Theme::SolarizedDark => Theme::SolarizedDark,
+        _Theme::GruvboxLight => Theme::GruvboxLight,
+        _Theme::GruvboxDark => Theme::GruvboxDark,
+        _Theme::CatppuccinLatte => Theme::CatppuccinLatte,
+        _Theme::CatppuccinFrappe => Theme::CatppuccinFrappe,
+        _Theme::CatppuccinMacchiato => Theme::CatppuccinMacchiato,
+        _Theme::CatppuccinMocha => Theme::CatppuccinMocha,
+        _Theme::TokyoNight => Theme::TokyoNight,
+        _Theme::TokyoNightStorm => Theme::TokyoNightStorm,
+        _Theme::TokyoNightLight => Theme::TokyoNightLight,
+        _Theme::KanagawaWave => Theme::KanagawaWave,
+        _Theme::KanagawaDragon => Theme::KanagawaDragon,
+        _Theme::KanagawaLotus => Theme::KanagawaLotus,
+        _Theme::Moonfly => Theme::Moonfly,
+        _Theme::Nightfly => Theme::Nightfly,
+        _Theme::Oxocarbon => Theme::Oxocarbon,
+        _Theme::Ferra => Theme::Ferra,
+    })
+}
+
+fn serialize_theme_name<S: serde::Serializer>(
+    t: &Theme,
+    s: S,
+) -> Result<<S as serde::Serializer>::Ok, S::Error> {
+    let t = match t {
+        Theme::Light => _Theme::Light,
+        Theme::Dark => _Theme::Dark,
+        Theme::Dracula => _Theme::Dracula,
+        Theme::Nord => _Theme::Nord,
+        Theme::SolarizedLight => _Theme::SolarizedLight,
+        Theme::SolarizedDark => _Theme::SolarizedDark,
+        Theme::GruvboxLight => _Theme::GruvboxLight,
+        Theme::GruvboxDark => _Theme::GruvboxDark,
+        Theme::CatppuccinLatte => _Theme::CatppuccinLatte,
+        Theme::CatppuccinFrappe => _Theme::CatppuccinFrappe,
+        Theme::CatppuccinMacchiato => _Theme::CatppuccinMacchiato,
+        Theme::CatppuccinMocha => _Theme::CatppuccinMocha,
+        Theme::TokyoNight => _Theme::TokyoNight,
+        Theme::TokyoNightStorm => _Theme::TokyoNightStorm,
+        Theme::TokyoNightLight => _Theme::TokyoNightLight,
+        Theme::KanagawaWave => _Theme::KanagawaWave,
+        Theme::KanagawaDragon => _Theme::KanagawaDragon,
+        Theme::KanagawaLotus => _Theme::KanagawaLotus,
+        Theme::Moonfly => _Theme::Moonfly,
+        Theme::Nightfly => _Theme::Nightfly,
+        Theme::Oxocarbon => _Theme::Oxocarbon,
+        Theme::Ferra => _Theme::Ferra,
+        Theme::Custom(_) => Err(serde::ser::Error::custom(
+            "Serialization of custom themes is not implemented",
+        ))?,
+    };
+
+    t.serialize(s)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Config {
     text_height: f32,
     padding: f32,
     spacing: f32,
     viewer: Viewer,
+    #[serde(
+        deserialize_with = "deserialize_theme_name",
+        serialize_with = "serialize_theme_name"
+    )]
+    theme: Theme,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            text_height: 20.0,
+            padding: 5.0,
+            spacing: 5.0,
+            viewer: Viewer {
+                program_name: "okular".to_string(),
+                page_arg: "--page".to_string(),
+            },
+            theme: Theme::Light,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -326,7 +441,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 fn results(state: &State) -> Element<'_, Message> {
     use iced::color;
     use iced::widget::{column, container, rich_text, row, scrollable, span, text, text_input};
-    let palette = state.theme.palette();
+    let palette = state.config.theme.palette();
 
     container(
         scrollable(column(
@@ -363,7 +478,7 @@ fn results(state: &State) -> Element<'_, Message> {
 }
 
 fn theme(s: &State) -> iced::Theme {
-    s.theme.clone()
+    s.config.theme.clone()
 }
 
 fn view(state: &State) -> iced::Element<'_, Message> {
@@ -491,6 +606,17 @@ fn new() -> State {
     let device = embed_model.device.clone();
     let loaded_files =
         load_saved_embeddings(&std::path::PathBuf::from("./embeddings.bin"), &device);
+    let cfg_path = std::path::PathBuf::from("./config.toml");
+    let config: Config = std::fs::File::open(cfg_path)
+        .map_err(|x| anyhow::Error::new(x).context("open config file"))
+        .map(BufReader::new)
+        .and_then(|mut x| {
+            let mut buf = String::new();
+            x.read_to_string(&mut buf).context("read config file")?;
+            Ok(buf)
+        })
+        .and_then(|x| toml::from_str(x.as_ref()).context("parse configuration"))
+        .unwrap_or_default();
     let (et, handles) = EmbedThread::create(embed_model);
     std::thread::spawn(|| embed_thread(et));
 
@@ -537,16 +663,7 @@ fn new() -> State {
         init_focus: false,
         device,
         highlight_index: 0,
-        theme: iced::theme::Theme::GruvboxDark,
-        config: Config {
-            text_height: 20.0,
-            padding: 5.0,
-            viewer: Viewer {
-                program_name: String::from("zathura"),
-                page_arg: String::from("--page"),
-            },
-            spacing: 1.0,
-        },
+        config,
         last_query: String::from(""),
     }
 }
