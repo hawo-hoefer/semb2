@@ -380,6 +380,7 @@ enum Message {
     SetTheme(_Theme),
     SetSpacing(f32),
     SetPadding(f32),
+    SetTextHeight(f32),
     SetViewerProgram(String),
     SetViewerPageArg(String),
     SetNewSearchPath(String),
@@ -621,6 +622,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.config_editor.new_seach_path = path;
             Task::none()
         }
+        Message::SetTextHeight(th) => {
+            state.config.text_height = th;
+            save_config(&state.config).unwrap();
+
+            Task::none()
+        }
     }
 }
 
@@ -670,12 +677,25 @@ fn theme(s: &State) -> iced::Theme {
     s.config.theme.clone()
 }
 
+fn centered_text<'a>(
+    t: impl iced::widget::text::IntoFragment<'a>,
+    padding: f32,
+    th: f32,
+) -> Element<'a, Message> {
+    use iced::widget::{container, text};
+
+    container(text(t).center().size(th).height(2.0 * padding + th)).into()
+}
+
 fn view(state: &State) -> iced::Element<'_, Message> {
     use iced::widget::{button, column, container, overlay, row, slider, space, text, text_input};
-    let ti = text_input("Enter Your Query", &state.query)
-        .on_input(Message::InputChanged)
-        .on_submit(Message::RunQuery)
-        .id("query_widget");
+    let ti = container(
+        text_input("Enter Your Query", &state.query)
+            .on_input(Message::InputChanged)
+            .on_submit(Message::RunQuery)
+            .id("query_widget"),
+    )
+    .padding(state.config.padding);
 
     let in_queue = state.handles.file_request_tx.len();
     let loaded = state.loaded_files.len();
@@ -688,20 +708,29 @@ fn view(state: &State) -> iced::Element<'_, Message> {
         pb = pb.style(iced::widget::progress_bar::secondary);
     }
 
+    let Config {
+        text_height: th,
+        padding: pad,
+        spacing: spc,
+        viewer: _,
+        theme: _,
+        root_paths: _,
+    } = state.config;
+
     let c = column!(
         row!(
-            button(iced::widget::text("⚙").center())
-                .on_press(Message::ToggleConfig)
-                .height(state.config.text_height + state.config.padding)
-                .padding([0.0, state.config.padding]),
-            space().width(state.config.spacing),
+            button(text("⚙").center().size(th)).on_press(Message::ToggleConfig),
+            space().width(spc),
             container(pb)
-                .height(state.config.text_height + state.config.padding)
-                .center_y(state.config.text_height + state.config.padding),
+                .height(2.0 * pad + th)
+                .center_y(2.0 * pad + th),
             space().width(state.config.spacing),
-            text(format!("Loaded {} documents", state.loaded_files.len()))
-        )
-        .padding([state.config.padding, 0.0]),
+            centered_text(
+                format!("Loaded {} documents", state.loaded_files.len()),
+                pad,
+                th
+            )
+        ),
         ti,
         container(results(state))
             .width(Fill)
@@ -715,61 +744,76 @@ fn view(state: &State) -> iced::Element<'_, Message> {
             float(
                 column!(
                     row!(
-                        button("❌").on_press(Message::ToggleConfig),
-                        space().width(state.config.spacing),
-                        text("Select Theme"),
-                        space().width(state.config.spacing),
+                        button(text("❌").center().size(th)).on_press(Message::ToggleConfig),
+                        space().width(spc),
+                        centered_text("Select Theme", pad, th),
+                        space().width(spc),
                         combo_box(
                             &state.config_editor.theme,
                             "Enter a theme",
                             Some(&(&state.config.theme).try_into().unwrap()),
                             Message::SetTheme,
-                        ),
+                        )
+                        .size(state.config.text_height)
                     ),
                     row!(
-                        text("Spacing"),
-                        space().width(state.config.spacing),
-                        slider(5.0..=50.0, state.config.spacing, Message::SetSpacing)
+                        centered_text("Text Size", pad, th),
+                        space().width(spc),
+                        slider(5.0..=50.0, th, Message::SetTextHeight)
                     ),
                     row!(
-                        text("Padding"),
-                        space().width(state.config.spacing),
-                        slider(5.0..=50.0, state.config.padding, Message::SetPadding)
+                        centered_text("Spacing", pad, th),
+                        space().width(spc),
+                        slider(5.0..=50.0, spc, Message::SetSpacing)
                     ),
                     row!(
-                        text("Viewer Program"),
-                        space().width(state.config.spacing),
+                        centered_text("Padding", pad, th),
+                        space().width(spc),
+                        slider(5.0..=50.0, pad, Message::SetPadding)
+                    ),
+                    iced::widget::rule::horizontal(spc / 4.0),
+                    row!(
+                        centered_text("Viewer Program", pad, th),
+                        space().width(spc),
                         text_input(
                             "your favourite pdf viewer",
                             &state.config.viewer.program_name
                         )
+                        .size(th)
                         .on_input(Message::SetViewerProgram)
                     ),
                     row!(
-                        text("Viewer Page Argument"),
+                        centered_text("Viewer Page Argument", pad, th),
                         space().width(state.config.spacing),
                         text_input(
                             "How to pass the page to open to your viewer",
                             &state.config.viewer.page_arg
                         )
+                        .size(th)
                         .on_input(Message::SetViewerPageArg)
                     ),
+                    iced::widget::rule::horizontal(spc / 4.0),
                     row!(
-                        text("Root Paths"),
+                        centered_text("Root Paths", pad, th),
                         space().width(state.config.spacing),
                         text_input("/path/to/documents/", &state.config_editor.new_seach_path)
+                            .size(th)
                             .on_input(Message::SetNewSearchPath)
                             .on_submit(Message::AddRootPath),
                     ),
                     row!(column(state.config.root_paths.iter().enumerate().map(
                         |(i, p)| {
                             row!(
-                                text(p.to_string_lossy()),
-                                button("❌").on_press(Message::RemoveSearchPath(i))
+                                space().width(spc * 4.0),
+                                button(text("❌").size(th).center())
+                                    .on_press(Message::RemoveSearchPath(i)),
+                                space().width(spc),
+                                centered_text(p.to_string_lossy(), pad, th),
                             )
                             .into()
                         }
-                    )))
+                    ))),
+                    iced::widget::rule::horizontal(spc / 4.0),
                 )
                 .padding(state.config.padding)
                 .spacing(state.config.spacing),
