@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use anyhow::Context;
 use candle_core::{DType, Tensor};
 use embed_anything::embeddings::local::colsmol::ColSmolEmbedder;
+use iced::Length::Fill;
 use iced::keyboard::Key;
 use iced::widget::operation::AbsoluteOffset;
 use iced::{Element, Subscription, Task, stream};
@@ -135,9 +136,16 @@ struct State {
     config: Config,
 }
 
+struct Viewer {
+    program_name: String,
+    page_arg: String,
+}
+
 struct Config {
     text_height: f32,
     padding: f32,
+    spacing: f32,
+    viewer: Viewer,
 }
 
 #[derive(Clone, Debug)]
@@ -282,8 +290,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     x: None,
                     y: Some(
                         state.highlight_index as f32
-                            * (state.config.text_height + state.config.padding)
-                            * 1.25,
+                            * (state.config.text_height
+                                + state.config.padding
+                                + state.config.spacing),
                     ),
                 },
             )
@@ -296,10 +305,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     selection.path,
                     selection.page
                 );
-                match std::process::Command::new("zathura")
+                match std::process::Command::new(state.config.viewer.program_name.clone())
                     .args(&[
                         selection.path.clone(),
-                        "--page".to_string(),
+                        state.config.viewer.page_arg.clone(),
                         selection.page.to_string(),
                     ])
                     .spawn()
@@ -337,6 +346,8 @@ fn results(state: &State) -> Element<'_, Message> {
                             .on_link_click(iced::never)
                             .size(state.config.text_height),
                     )
+                    .width(Fill)
+                    .center_y(Fill)
                     .padding(state.config.padding)
                     .style(container::rounded_box)
                     .id(format!("result-{i}"))
@@ -356,8 +367,7 @@ fn theme(s: &State) -> iced::Theme {
 }
 
 fn view(state: &State) -> iced::Element<'_, Message> {
-    use iced::color;
-    use iced::widget::{column, container, rich_text, row, span, text, text_input};
+    use iced::widget::{column, container, text_input};
     let ti = text_input("Enter Your Query", &state.query)
         .on_input(Message::InputChanged)
         .on_submit(Message::RunQuery)
@@ -367,12 +377,18 @@ fn view(state: &State) -> iced::Element<'_, Message> {
     let loaded = state.loaded_files.len();
     let total = in_queue + loaded;
 
-    container(column!(
-        container(iced::widget::progress_bar(0.0..=total as f32, loaded as f32).girth(10))
-            .padding([state.config.padding, 0.0]),
-        ti,
-        container(results(state)).padding([state.config.padding, 0.0])
-    ))
+    container(
+        column!(
+            container(iced::widget::progress_bar(0.0..=total as f32, loaded as f32).girth(10))
+                .padding([state.config.padding, 0.0]),
+            ti,
+            container(results(state))
+                .width(Fill)
+                .height(Fill)
+                .padding([state.config.padding, 0.0])
+        )
+        .spacing(state.config.spacing),
+    )
     .padding(state.config.padding)
     .into()
 }
@@ -525,6 +541,11 @@ fn new() -> State {
         config: Config {
             text_height: 20.0,
             padding: 5.0,
+            viewer: Viewer {
+                program_name: String::from("zathura"),
+                page_arg: String::from("--page"),
+            },
+            spacing: 1.0,
         },
         last_query: String::from(""),
     }
