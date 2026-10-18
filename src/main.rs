@@ -632,7 +632,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 }
 
 fn results(state: &State) -> Element<'_, Message> {
-    use iced::color;
     use iced::widget::{column, container, rich_text, row, scrollable, span, text, text_input};
     let palette = state.config.theme.palette();
 
@@ -651,7 +650,7 @@ fn results(state: &State) -> Element<'_, Message> {
                         };
 
                         container(
-                            rich_text([span(format!("{score:.3} {path} | {page}\n")).color(fg)])
+                            rich_text([span(format!("{path} {page}\n")).color(fg)])
                                 .on_link_click(iced::never)
                                 .size(state.config.text_height),
                         )
@@ -818,7 +817,7 @@ fn view(state: &State) -> iced::Element<'_, Message> {
                 .padding(state.config.padding)
                 .spacing(state.config.spacing),
             ),
-            c // c.into()
+            c
         ];
         return c.into();
     }
