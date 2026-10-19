@@ -10,6 +10,7 @@ $ cargo install --path .
 ## Roadmap
 - [x] add previewing of pages when tabbing through results
 - [x] improve asynchronous model loading
+- [ ] make embeddings loadable per-file somehow to improve async loading even more
 - [ ] Robustness: fix all uses of unwrap
 - [ ] dampen dependency hell a bit
 - [ ] make double query to open work again
