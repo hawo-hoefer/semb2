@@ -68,15 +68,21 @@ fn embed_file(
     embedder: &ColSmolEmbedder,
     file_path: PathBuf,
     batch_size: usize,
+    et: &EmbedThreadHandles,
 ) -> Result<Tensor, anyhow::Error> {
     let pages = embed_anything::embeddings::local::colpali::get_images_from_pdf(&file_path)?;
     let mut embed_data = Vec::new();
     let n_batches = (pages.len() as f32 / batch_size as f32).ceil() as usize;
     for (i, batch) in pages.chunks(batch_size).enumerate() {
+        let i = i + 1;
         log::info!(
             "Embedding batch {i} / {n_batches} of {}",
             file_path.display()
         );
+        let _ = et.send_log(format!(
+            "Embedding batch {i} / {n_batches} of {}",
+            file_path.display()
+        ));
         // let start_page = index * batch_size + 1;
         // let end_page = start_page + batch.len();
         // let page_numbers = (start_page..=end_page).collect::<Vec<_>>();
@@ -207,12 +213,13 @@ struct State {
     results: Vec<QueryResult>,
     loaded_files: HashMap<String, DocData>,
     init_focus: bool,
-    device: candle_core::Device,
     highlight_index: usize,
     config: Config,
     show_config: bool,
+    show_log: bool,
     config_editor: ConfigEditorState,
     preview_cache: HashMap<(String, usize), iced::widget::image::Handle>,
+    log: Vec<LogMessage>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -423,7 +430,8 @@ enum Message {
     RunQuery,
     QueryProcessed(String, Tensor),
     DocumentProcessed(String, DocData),
-    InitFocus,
+    ToggleLog,
+    FocusInput,
     ToggleConfig,
     Open,
     MoveHighlight { down: bool },
@@ -437,6 +445,7 @@ enum Message {
     AddRootPath,
     RemoveSearchPath(usize),
     ToggleShowPreview,
+    NewLogMessage,
 }
 
 fn save_config(cfg: &Config) -> Result<(), anyhow::Error> {
@@ -606,7 +615,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
             Task::none()
         }
-        Message::InitFocus => {
+        Message::FocusInput => {
             state.init_focus = true;
             iced::widget::operation::focus("query_widget")
         }
@@ -718,6 +727,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ToggleShowPreview => {
             state.config.show_preview = !state.config.show_preview;
             save_config(&state.config).unwrap();
+
+            Task::none()
+        }
+        Message::NewLogMessage => {
+            for log_msg in state.handles.log_rx.try_iter() {
+                state.log.push(log_msg)
+            }
+
+            Task::none()
+        }
+        Message::ToggleLog => {
+            state.show_log = !state.show_log;
 
             Task::none()
         }
@@ -869,6 +890,20 @@ fn config_editor(state: &State) -> iced::Element<'_, Message> {
     .into()
 }
 
+fn show_log(state: &State) -> iced::Element<'_, Message> {
+    use iced::widget::{column, container, scrollable, text};
+
+    container(
+        scrollable(column(state.log.iter().rev().map(|x| {
+            text(format!("[{}] {}", x.time.format("%H:%M:%S"), x.msg)).into()
+        })))
+        .height(state.log.len().min(3) as f32 * (state.config.text_height + state.config.padding))
+        .width(Fill),
+    )
+    .padding(state.config.padding)
+    .into()
+}
+
 fn view(state: &State) -> iced::Element<'_, Message> {
     use iced::widget::{button, column, container, overlay, row, slider, space, text, text_input};
     let Config {
@@ -951,17 +986,37 @@ fn view(state: &State) -> iced::Element<'_, Message> {
         .into();
     }
 
+    if state.show_log {
+        c = column!(c, space().height(spc / 4.0), show_log(state)).into();
+    }
+
     c
 }
 
-struct EmbedThread {
-    model: ColSmolEmbedder,
+struct LogMessage {
+    msg: String,
+    time: chrono::DateTime<chrono::Local>,
+}
 
+struct EmbedThreadHandles {
     query_request_rx: crossbeam_channel::Receiver<String>,
     query_embedding_tx: crossbeam_channel::Sender<(String, Tensor)>,
 
     file_request_rx: crossbeam_channel::Receiver<PathBuf>,
     file_embedding_tx: crossbeam_channel::Sender<(String, DocData)>,
+
+    log_tx: crossbeam_channel::Sender<LogMessage>,
+}
+
+impl EmbedThreadHandles {
+    fn send_log(&self, msg: String) -> Result<(), anyhow::Error> {
+        self.log_tx
+            .send(LogMessage {
+                msg,
+                time: chrono::Local::now(),
+            })
+            .context("send log message")
+    }
 }
 
 struct EmbedHandles {
@@ -970,35 +1025,42 @@ struct EmbedHandles {
 
     file_request_tx: crossbeam_channel::Sender<PathBuf>,
     file_embedding_rx: crossbeam_channel::Receiver<(String, DocData)>,
+
+    log_rx: crossbeam_channel::Receiver<LogMessage>,
 }
 
-impl EmbedThread {
-    fn create(model: ColSmolEmbedder) -> (EmbedThread, EmbedHandles) {
+impl EmbedThreadHandles {
+    fn create() -> (EmbedThreadHandles, EmbedHandles) {
         let (query_request_tx, query_request_rx) = crossbeam_channel::unbounded();
         let (query_embedding_tx, query_embedding_rx) = crossbeam_channel::unbounded();
 
         let (file_request_tx, file_request_rx) = crossbeam_channel::unbounded();
         let (file_embedding_tx, file_embedding_rx) = crossbeam_channel::unbounded();
 
+        let (log_tx, log_rx) = crossbeam_channel::unbounded();
+
         (
-            EmbedThread {
-                model,
+            EmbedThreadHandles {
                 query_request_rx,
                 query_embedding_tx,
                 file_request_rx,
                 file_embedding_tx,
+                log_tx,
             },
             EmbedHandles {
                 query_request_tx,
                 query_embedding_rx,
                 file_request_tx,
                 file_embedding_rx,
+                log_rx,
             },
         )
     }
 }
 
-fn embed_thread(et: EmbedThread) {
+fn embed_thread(et: EmbedThreadHandles) {
+    let model = load_model();
+
     let mut s = crossbeam_channel::Select::new_biased();
     s.recv(&et.query_request_rx);
     s.recv(&et.file_request_rx);
@@ -1016,7 +1078,8 @@ fn embed_thread(et: EmbedThread) {
                     }
                 };
                 log::info!("Received embedding request for query {query}");
-                let embedded = embed_query(&et.model, &query).and_then(normalize).unwrap();
+                let _ = et.send_log(format!("Embedding query: '{query}'"));
+                let embedded = embed_query(&model, &query).and_then(normalize).unwrap();
                 et.query_embedding_tx.send((query, embedded.to_device(&candle_core::Device::Cpu).unwrap())).unwrap();
             }
             recv(et.file_request_rx) -> path => {
@@ -1036,7 +1099,7 @@ fn embed_thread(et: EmbedThread) {
                 let meta = std::fs::metadata(&path).unwrap();
                 let modified = meta.modified().unwrap();
 
-                let embedded = match embed_file(&et.model, path.clone(), 1).and_then(normalize) {
+                let embedded = match embed_file(&model, path.clone(), 1, &et).and_then(normalize) {
                     Ok(embedded) => Some(embedded.to_device(&candle_core::Device::Cpu).unwrap()),
                     Err(e) => {
                         log::error!("Could not embed file {}. If there is a size mismatch, this is likely due to varying page sizes. Error: {e}", path.display());
@@ -1051,13 +1114,11 @@ fn embed_thread(et: EmbedThread) {
 }
 
 fn new() -> State {
-    let embed_model = load_model();
-
-    let device = embed_model.device.clone();
     let loaded_files = load_saved_embeddings(
         &std::path::PathBuf::from(&PATHS.embedding_cache_path),
         &candle_core::Device::Cpu,
     );
+
     let config: Config = std::fs::File::open(&PATHS.config_path)
         .map_err(|x| anyhow::Error::new(x).context("open config file"))
         .map(BufReader::new)
@@ -1068,7 +1129,7 @@ fn new() -> State {
         })
         .and_then(|x| toml::from_str(x.as_ref()).context("parse configuration"))
         .unwrap_or_default();
-    let (et, handles) = EmbedThread::create(embed_model);
+    let (et, handles) = EmbedThreadHandles::create();
     std::thread::spawn(|| embed_thread(et));
 
     let mut state = State {
@@ -1077,7 +1138,6 @@ fn new() -> State {
         loaded_files: loaded_files,
         handles,
         init_focus: false,
-        device,
         highlight_index: 0,
         config,
         last_query: String::from(""),
@@ -1110,6 +1170,8 @@ fn new() -> State {
             new_seach_path: "".to_string(),
         },
         preview_cache: HashMap::new(),
+        show_log: false,
+        log: Vec::new(),
     };
 
     for np in state.config.root_paths.clone().iter() {
@@ -1194,7 +1256,7 @@ fn load_saved_embeddings(
 fn init_focus() -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::SinkExt;
     stream::channel(100, async |mut output| {
-        output.send(Message::InitFocus).await;
+        output.send(Message::FocusInput).await;
     })
 }
 
@@ -1211,7 +1273,7 @@ fn main() -> iced::Result {
                 subscriptions.push(Subscription::run_with(embedded, |x| {
                     let path = x.0.clone();
                     let data = x.1.clone();
-                    stream::channel(1, async |mut output| {
+                    stream::channel(100, async |mut output| {
                         use iced::futures::SinkExt;
                         output
                             .send(Message::DocumentProcessed(path, data))
@@ -1219,6 +1281,13 @@ fn main() -> iced::Result {
                             .unwrap();
                     })
                 }))
+            }
+
+            if state.show_log {
+                subscriptions.push(
+                    iced::time::every(std::time::Duration::from_millis(250))
+                        .map(|_| Message::NewLogMessage),
+                );
             }
 
             subscriptions.push(iced::keyboard::listen().filter_map(|x| match x {
@@ -1238,7 +1307,9 @@ fn main() -> iced::Result {
                     } else if key == Key::Character("o".into()) && modifiers.control() {
                         Some(Message::Open)
                     } else if key == Key::Character("l".into()) && modifiers.control() {
-                        Some(Message::InitFocus)
+                        Some(Message::FocusInput)
+                    } else if key == Key::Character("m".into()) && modifiers.control() {
+                        Some(Message::ToggleLog)
                     } else {
                         None
                     }
