@@ -686,17 +686,21 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::RemoveSearchPath(idx) => {
             let root = state.config.root_paths.remove(idx);
+            let before = state.loaded_files.len();
             state.loaded_files = state
                 .loaded_files
                 .drain()
                 .filter(|(path, _data)| !PathBuf::from(path).starts_with(&root))
                 .collect();
+            let after = state.loaded_files.len();
+            state.n_docs_total -= before - after;
             Task::none()
         }
         Message::AddRootPath => {
             let mut new_path = String::new();
             std::mem::swap(&mut new_path, &mut state.config_editor.new_seach_path);
-            locate_documents(state, &new_path);
+            let n = locate_documents(state, &new_path);
+            state.n_docs_total += n;
             state.config.root_paths.push(new_path.into());
             save_config(&state.config).unwrap();
 
@@ -973,16 +977,16 @@ fn view(state: &State) -> iced::Element<'_, Message> {
                 .into()
             });
 
+        if state.show_log {
+            c = column!(c, space().height(spc / 4.0), show_log(state)).into();
+        }
+
         c = row!(
             c,
             iced::widget::rule::vertical(state.config.spacing / 4.0),
             img
         )
         .into();
-    }
-
-    if state.show_log {
-        c = column!(c, space().height(spc / 4.0), show_log(state)).into();
     }
 
     c
@@ -1206,9 +1210,7 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
                                     last_mtime: modified,
                                     page_embeddings: None,
                                 };
-                                et.file_embedding_tx
-                                    .send((key.clone(), doc_data))
-                                    .unwrap();
+                                et.file_embedding_tx.send((key.clone(), doc_data)).unwrap();
                                 continue;
                             }
                         };
@@ -1231,7 +1233,6 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
         for (file, embed) in loaded_files.drain() {
             et.file_embedding_tx.send((file, embed)).unwrap();
         }
-
     }
 
     loop {
@@ -1370,7 +1371,8 @@ fn new() -> State {
     state
 }
 
-fn locate_documents(state: &mut State, root: impl AsRef<Path>) {
+fn locate_documents(state: &mut State, root: impl AsRef<Path>) -> usize {
+    let mut n = 0;
     for f in walkdir::WalkDir::new(root).into_iter().filter_map(|f| {
         match f {
             Ok(f)
@@ -1401,8 +1403,10 @@ fn locate_documents(state: &mut State, root: impl AsRef<Path>) {
         } else {
             log::info!("Queuing embedding of {key}");
             state.handles.file_request_tx.send(f).unwrap();
+            n += 1;
         }
     }
+    n
 }
 
 fn load_saved_embeddings(
