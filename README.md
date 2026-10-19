@@ -14,3 +14,4 @@ $ cargo install --path .
 - [ ] dampen dependency hell a bit
 - [ ] make double query to open work again
 - [ ] add status messages
+- [ ] add placeholders for files which errored during loading so we don't have to load them again
