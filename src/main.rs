@@ -5,17 +5,15 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::Context;
-use candle_core::{DType, Tensor};
-use embed_anything::embeddings::local::colpali::get_images_from_pdf;
+use candle_core::{DType, IndexOp, Tensor};
 use embed_anything::embeddings::local::colsmol::ColSmolEmbedder;
 use iced::Length::Fill;
 use iced::keyboard::Key;
+use iced::widget::combo_box;
 use iced::widget::image::Handle;
 use iced::widget::operation::AbsoluteOffset;
-use iced::widget::{combo_box, float};
 use iced::{Element, Subscription, Task, Theme, stream};
-use image::imageops::overlay;
-use image::{DynamicImage, GenericImageView};
+use image::DynamicImage;
 use serde::Serialize;
 use wincode::len::BincodeLen;
 
@@ -52,69 +50,6 @@ fn get_pdf_page(file_path: impl AsRef<Path>, page: u32) -> Result<DynamicImage, 
     Ok(pages.drain(..).nth(0).unwrap())
 }
 
-fn max_sim(query_embedding: &Tensor, document_embedding: &Tensor) -> Result<Tensor, anyhow::Error> {
-    const DOC_DIM: usize = 2;
-    const QUERY_DIM: usize = 1;
-    const FEATURE_DIM: usize = 3;
-    let qe = query_embedding.unsqueeze(DOC_DIM)?;
-    let de = document_embedding.unsqueeze(QUERY_DIM)?;
-
-    let dot_product = qe.broadcast_mul(&de)?.sum((FEATURE_DIM,))?;
-    let scores = (dot_product.max(DOC_DIM)?).sum(QUERY_DIM)?;
-    Ok(scores)
-}
-
-fn embed_file(
-    embedder: &ColSmolEmbedder,
-    file_path: PathBuf,
-    batch_size: usize,
-    et: &EmbedThreadHandles,
-) -> Result<Tensor, anyhow::Error> {
-    let pages = embed_anything::embeddings::local::colpali::get_images_from_pdf(&file_path)?;
-    let mut embed_data = Vec::new();
-    let n_batches = (pages.len() as f32 / batch_size as f32).ceil() as usize;
-    for (i, batch) in pages.chunks(batch_size).enumerate() {
-        let i = i + 1;
-        log::info!(
-            "Embedding batch {i} / {n_batches} of {}",
-            file_path.display()
-        );
-        let _ = et.send_log(format!(
-            "Embedding batch {i} / {n_batches} of {}",
-            file_path.display()
-        ));
-        // let start_page = index * batch_size + 1;
-        // let end_page = start_page + batch.len();
-        // let page_numbers = (start_page..=end_page).collect::<Vec<_>>();
-        let (input_ids, attention_mask, pixel_values, pixel_attention_mask) = embedder
-            .processor
-            .preprocess(batch, &embedder.device)
-            .context("error in preprocessing")?;
-
-        let image_embeddings = embedder
-            .model
-            .write()
-            .map_err(|e| anyhow::anyhow!("{}", e))?
-            .forward(
-                &input_ids,
-                &attention_mask,
-                &Some(pixel_values),
-                &pixel_attention_mask,
-            )
-            .context("Error in running model")?
-            .to_dtype(DType::F32)?;
-
-        let image_embeddings = image_embeddings
-            .unsqueeze(0)?
-            .avg_pool2d((2, 1))?
-            .squeeze(0)?;
-
-        embed_data.push(image_embeddings);
-    }
-
-    Ok(Tensor::cat(&embed_data, 0)?)
-}
-
 fn embed_query(embedder: &ColSmolEmbedder, query: &str) -> Result<Tensor, anyhow::Error> {
     let (input_ids, attention_mask) = embedder
         .processor
@@ -142,18 +77,24 @@ struct SavedEmbedding {
     #[wincode(with = "wincode::containers::Vec<f32, Max8GB>")]
     data: Vec<f32>,
     shape: Vec<usize>,
+    page_sizes: Vec<usize>,
 }
 
 impl SavedEmbedding {
-    pub fn new(data: Tensor) -> Self {
+    pub fn new(embeddings: PageEmbeddings) -> Self {
         Self {
-            data: data.flatten_all().unwrap().to_vec1().unwrap(),
-            shape: data.shape().clone().into_dims(),
+            data: embeddings.data.flatten_all().unwrap().to_vec1().unwrap(),
+            shape: embeddings.data.shape().clone().into_dims(),
+            page_sizes: embeddings.page_sizes,
         }
     }
 
-    fn into_tensor(self, device: &candle_core::Device) -> Tensor {
-        Tensor::from_vec(self.data, self.shape, device).unwrap()
+    fn into_loaded(self, device: &candle_core::Device) -> PageEmbeddings {
+        let embeddings = Tensor::from_vec(self.data, self.shape, device).unwrap();
+        PageEmbeddings {
+            data: embeddings,
+            page_sizes: self.page_sizes,
+        }
     }
 }
 
@@ -163,10 +104,57 @@ struct SavedDocData {
     embedding: Option<SavedEmbedding>,
 }
 
+#[derive(Debug, Clone)]
+struct PageEmbeddings {
+    /// [of shape n_chunks, embed_dim]
+    data: Tensor,
+    /// sizes in data [dim 0]. page 0 is data[0..page_sizes[0]], etc
+    page_sizes: Vec<usize>,
+}
+
+impl PageEmbeddings {
+    fn from_pages(pages: Vec<Tensor>) -> Self {
+        let sizes = pages.iter().map(|x| x.dim(0).unwrap()).collect();
+        let embeddings = Tensor::cat(&pages, 0).expect("have same first dim");
+        Self {
+            data: embeddings,
+            page_sizes: sizes,
+        }
+    }
+
+    /// compute MaxSim across all pages of a document
+    ///
+    /// * `query`: query embedding of shape [n_query_chunks, embed_dim]
+    fn compute_max_sim(&self, query: &Tensor) -> Result<Vec<f32>, anyhow::Error> {
+        const QUERY_DIM: usize = 0;
+        const CHUNK_DIM: usize = 1;
+        const FEATURE_DIM: usize = 2;
+
+        let qe = query.unsqueeze(CHUNK_DIM)?;
+        let de = self.data.unsqueeze(QUERY_DIM)?;
+        let dot_product = qe.broadcast_mul(&de)?.sum((FEATURE_DIM,))?;
+
+        let mut start = 0;
+        let mut scores = Vec::with_capacity(self.page_sizes.len());
+        for p in self.page_sizes.iter() {
+            scores.push(
+                dot_product
+                    .i((.., start..start + p))?
+                    .max(CHUNK_DIM)?
+                    .sum(QUERY_DIM)?
+                    .to_vec0()?,
+            );
+            start += p;
+        }
+
+        Ok(scores)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DocData {
     last_mtime: SystemTime,
-    page_embeddings: Option<Tensor>,
+    page_embeddings: Option<PageEmbeddings>,
 }
 
 impl Hash for DocData {
@@ -190,17 +178,6 @@ struct QueryResult {
     score: f32,
 }
 
-enum EmbedRequest {
-    File(PathBuf),
-    Query(String),
-}
-
-#[derive(Clone)]
-enum EmbedResult {
-    File(String, DocData),
-    Query(Tensor),
-}
-
 struct ConfigEditorState {
     theme: combo_box::State<_Theme>,
     new_seach_path: String,
@@ -217,6 +194,7 @@ struct State {
     config: Config,
     show_config: bool,
     show_log: bool,
+    n_docs_total: usize,
     config_editor: ConfigEditorState,
     preview_cache: HashMap<(String, usize), iced::widget::image::Handle>,
     log: Vec<LogMessage>,
@@ -446,6 +424,7 @@ enum Message {
     RemoveSearchPath(usize),
     ToggleShowPreview,
     NewLogMessage,
+    ChangeNTotal,
 }
 
 fn save_config(cfg: &Config) -> Result<(), anyhow::Error> {
@@ -549,10 +528,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 };
 
                 // TODO: think about moving this back to the GPU if it's too slow
-                let scores = max_sim(&query_embedding, &doc_embedding)
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap();
+                let scores = doc_embedding.compute_max_sim(&query_embedding).unwrap();
 
                 for (i, score) in scores.into_iter().enumerate() {
                     state.results.push(QueryResult {
@@ -567,7 +543,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 .results
                 .sort_by(|a, b| f32::total_cmp(&b.score, &a.score));
 
-            {
+            if state.results.len() > 0 {
                 let result = &state.results[state.highlight_index];
                 update_preview_cache(state, result.path.clone(), result.page);
             }
@@ -605,13 +581,25 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::DocumentProcessed(path, doc_data) => {
             log::info!("Finished processing {path}");
-            state.loaded_files.insert(path, doc_data);
-            save_embeddings(&state.loaded_files).unwrap_or_else(|err| {
-                log::error!(
-                    "Could not save embeddings to {}: {err}",
-                    PATHS.embedding_cache_path.display()
+            if state
+                .config
+                .root_paths
+                .iter()
+                .map(|x| x.to_string_lossy().to_string())
+                .any(|x| path.starts_with(&x))
+            {
+                state.loaded_files.insert(path, doc_data);
+                save_embeddings(&state.loaded_files).unwrap_or_else(|err| {
+                    log::error!(
+                        "Could not save embeddings to {}: {err}",
+                        PATHS.embedding_cache_path.display()
+                    );
+                });
+            } else {
+                log::info!(
+                    "Skipping adding of file {path} to loaded files. No longer matches a root path"
                 );
-            });
+            }
 
             Task::none()
         }
@@ -739,6 +727,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ToggleLog => {
             state.show_log = !state.show_log;
+
+            Task::none()
+        }
+        Message::ChangeNTotal => {
+            for diff in state.handles.num_files_rx.try_iter() {
+                if diff < 0 && (-diff) as usize > state.n_docs_total {
+                    state.n_docs_total = 0;
+                } else {
+                    state.n_docs_total = (state.n_docs_total as isize + diff) as usize;
+                }
+            }
+            log::info!("updated n_docs_total to {}", state.n_docs_total);
 
             Task::none()
         }
@@ -924,9 +924,8 @@ fn view(state: &State) -> iced::Element<'_, Message> {
     )
     .padding(pad);
 
-    let in_queue = state.handles.file_request_tx.len();
     let loaded = state.loaded_files.len();
-    let total = in_queue + loaded;
+    let total = state.n_docs_total;
     let mut pb = iced::widget::progress_bar(0.0..=total as f32, loaded as f32)
         .girth(state.config.text_height);
     if loaded == total {
@@ -943,11 +942,7 @@ fn view(state: &State) -> iced::Element<'_, Message> {
                 .height(2.0 * pad + th)
                 .center_y(2.0 * pad + th),
             space().width(state.config.spacing),
-            centered_text(
-                format!("Loaded {} documents", state.loaded_files.len()),
-                pad,
-                th
-            )
+            centered_text(format!("Loaded {} / {total} documents", loaded), pad, th)
         ),
         ti,
         container(results(state))
@@ -1005,18 +1000,21 @@ struct EmbedThreadHandles {
     file_request_rx: crossbeam_channel::Receiver<PathBuf>,
     file_embedding_tx: crossbeam_channel::Sender<(String, DocData)>,
 
+    num_files_tx: crossbeam_channel::Sender<isize>,
+
     log_tx: crossbeam_channel::Sender<LogMessage>,
 }
 
-impl EmbedThreadHandles {
-    fn send_log(&self, msg: String) -> Result<(), anyhow::Error> {
-        self.log_tx
-            .send(LogMessage {
-                msg,
-                time: chrono::Local::now(),
-            })
-            .context("send log message")
-    }
+fn send_log(
+    log_tx: &crossbeam_channel::Sender<LogMessage>,
+    msg: String,
+) -> Result<(), anyhow::Error> {
+    log_tx
+        .send(LogMessage {
+            msg,
+            time: chrono::Local::now(),
+        })
+        .context("send log message")
 }
 
 struct EmbedHandles {
@@ -1025,6 +1023,8 @@ struct EmbedHandles {
 
     file_request_tx: crossbeam_channel::Sender<PathBuf>,
     file_embedding_rx: crossbeam_channel::Receiver<(String, DocData)>,
+
+    num_files_rx: crossbeam_channel::Receiver<isize>,
 
     log_rx: crossbeam_channel::Receiver<LogMessage>,
 }
@@ -1037,6 +1037,8 @@ impl EmbedThreadHandles {
         let (file_request_tx, file_request_rx) = crossbeam_channel::unbounded();
         let (file_embedding_tx, file_embedding_rx) = crossbeam_channel::unbounded();
 
+        let (num_files_tx, num_files_rx) = crossbeam_channel::unbounded();
+
         let (log_tx, log_rx) = crossbeam_channel::unbounded();
 
         (
@@ -1046,6 +1048,7 @@ impl EmbedThreadHandles {
                 file_request_rx,
                 file_embedding_tx,
                 log_tx,
+                num_files_tx,
             },
             EmbedHandles {
                 query_request_tx,
@@ -1053,72 +1056,258 @@ impl EmbedThreadHandles {
                 file_request_tx,
                 file_embedding_rx,
                 log_rx,
+                num_files_rx,
             },
         )
     }
 }
 
-fn embed_thread(et: EmbedThreadHandles) {
-    let model = load_model();
+fn embed_single_page(
+    image: DynamicImage,
+    embedder: &ColSmolEmbedder,
+) -> Result<(Tensor), anyhow::Error> {
+    let (input_ids, attention_mask, pixel_values, pixel_attention_mask) = embedder
+        .processor
+        .preprocess(&[image], &embedder.device)
+        .context("error in preprocessing")?;
+
+    let image_embeddings = embedder
+        .model
+        .write()
+        .map_err(|e| anyhow::anyhow!("{}", e))?
+        .forward(
+            &input_ids,
+            &attention_mask,
+            &Some(pixel_values),
+            &pixel_attention_mask,
+        )
+        .context("Error in running model")?
+        .to_dtype(DType::F32)?;
+
+    let image_embeddings = image_embeddings
+        .unsqueeze(0)
+        .context("squeeze before pooling")?
+        .avg_pool2d((2, 1))
+        .context("token pooling")?
+        .squeeze(0)
+        .context("squeeze after pooling")?;
+
+    Ok(image_embeddings)
+}
+
+fn embed_worker(
+    query_rx: crossbeam_channel::Receiver<String>,
+    page_rx: crossbeam_channel::Receiver<(PathBuf, usize, DynamicImage)>,
+    query_tx: crossbeam_channel::Sender<(String, Tensor)>,
+    page_tx: crossbeam_channel::Sender<(PathBuf, usize, Tensor)>,
+    log_tx: crossbeam_channel::Sender<LogMessage>,
+) {
+    let embedder = load_model();
 
     let mut s = crossbeam_channel::Select::new_biased();
-    s.recv(&et.query_request_rx);
-    s.recv(&et.file_request_rx);
+    s.recv(&query_rx);
+    s.recv(&page_rx);
 
     loop {
         crossbeam_channel::select_biased! {
-            recv(et.query_request_rx) -> query => {
-                let query = match query {
-                    Ok(q) => q,
-                    Err(e) => {
-                        log::error!(
-                            "Error in embedding thread trying to receive from query request channel: {e}. Aborting..."
-                        );
-                        break;
-                    }
-                };
-                log::info!("Received embedding request for query {query}");
-                let _ = et.send_log(format!("Embedding query: '{query}'"));
-                let embedded = embed_query(&model, &query).and_then(normalize).unwrap();
-                et.query_embedding_tx.send((query, embedded.to_device(&candle_core::Device::Cpu).unwrap())).unwrap();
-            }
-            recv(et.file_request_rx) -> path => {
-                let path = match path {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::error!(
-                            "Error in embedding thread trying to receive from file request channel: {e}. Aborting..."
-                        );
-                        break;
-                    }
-                };
-                log::info!(
-                    "Received embedding request for document {path}",
-                    path = path.display()
+            recv(&query_rx) -> res => match res {
+                Ok(query) => {
+                    log::info!("Received embedding request for query {query}");
+                    let _ = send_log(&log_tx, format!("Embedding query: '{query}'"));
+                    let embedded = embed_query(&embedder, &query).and_then(normalize).unwrap().squeeze(0).unwrap();
+                    let _ = query_tx.send((query, embedded.to_device(&candle_core::Device::Cpu).unwrap())).unwrap();
+                }
+                Err(e) => {
+                    log::error!(
+                    "Error in embedding thread trying to receive from query request channel: {e}. Aborting..."
                 );
-                let meta = std::fs::metadata(&path).unwrap();
-                let modified = meta.modified().unwrap();
-
-                let embedded = match embed_file(&model, path.clone(), 1, &et).and_then(normalize) {
-                    Ok(embedded) => Some(embedded.to_device(&candle_core::Device::Cpu).unwrap()),
-                    Err(e) => {
-                        log::error!("Could not embed file {}. If there is a size mismatch, this is likely due to varying page sizes. Error: {e}", path.display());
-                        None
-                    },
-                };
-                et.file_embedding_tx.send((path.to_string_lossy().to_string(), DocData { last_mtime: modified, page_embeddings: embedded })).unwrap();
+                    break;
+                }
+            },
+            recv(&page_rx) -> res => match res {
+                Ok((path, page_no, image)) => {
+                    let embedding = embed_single_page(image, &embedder).unwrap().squeeze(0).unwrap();
+                    let _ = send_log(&log_tx, format!("Embedding Page {} of {}", page_no + 1, path.display())).unwrap();
+                    let _ = page_tx.send((path, page_no, embedding.to_device(&candle_core::Device::Cpu).unwrap())).unwrap();
+                }
+                Err(e) => {
+                    log::error!("[embed_worker] Could not receive from channel: {e}. Exiting...");
+                    break;
+                }
             }
         }
     }
+}
+
+fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
+    let mut current_documents = HashMap::new();
+    let (query_request_tx, query_request_rx) = crossbeam_channel::unbounded();
+    let (page_request_tx, page_request_rx) = crossbeam_channel::unbounded();
+    let (query_embedding_tx, query_embedding_rx) = crossbeam_channel::unbounded();
+    let (page_embedding_tx, page_embedding_rx) = crossbeam_channel::unbounded();
+
+    let handle = std::thread::spawn(|| {
+        embed_worker(
+            query_request_rx,
+            page_request_rx,
+            query_embedding_tx,
+            page_embedding_tx,
+            et.log_tx,
+        )
+    });
+
+    {
+        let mut loaded_files = load_saved_embeddings(
+            &std::path::PathBuf::from(&PATHS.embedding_cache_path),
+            &candle_core::Device::Cpu,
+        );
+
+        for p in root_paths {
+            for f in walkdir::WalkDir::new(p).into_iter().filter_map(|f| {
+                match f {
+                    Ok(f)
+                        if f.file_name()
+                            .to_str()
+                            .expect("should be convertible to str")
+                            .ends_with(".pdf") =>
+                    {
+                        Some(f.into_path())
+                    }
+                    Ok(_) => {
+                        // not a pdf
+                        None
+                    }
+                    Err(e) => {
+                        log::warn!("Could not load file: {e}");
+                        None
+                    }
+                }
+            }) {
+                let meta = std::fs::metadata(&f).unwrap();
+                let modified = meta.modified().unwrap();
+                let key = f.to_string_lossy().to_string();
+
+                if loaded_files.contains_key(&key) && loaded_files[&key].last_mtime >= modified {
+                    log::info!("Skipping {key}. Already embedded before");
+                } else {
+                    log::info!("Queuing embedding of {key}");
+
+                    let meta = std::fs::metadata(&f).unwrap();
+                    let modified = meta.modified().unwrap();
+                    let mut pages =
+                        match embed_anything::embeddings::local::colpali::get_images_from_pdf(&f) {
+                            Ok(pages) => pages,
+                            Err(err) => {
+                                log::error!(
+                                    "Could not render pages of document {}: {err}. Skipping...",
+                                    f.display()
+                                );
+                                let doc_data = DocData {
+                                    last_mtime: modified,
+                                    page_embeddings: None,
+                                };
+                                et.file_embedding_tx
+                                    .send((key.clone(), doc_data))
+                                    .unwrap();
+                                continue;
+                            }
+                        };
+
+                    let mut page_data = Vec::<Option<Tensor>>::new();
+                    page_data.resize(pages.len(), None);
+                    current_documents.insert(f.clone(), (page_data, modified));
+
+                    for (i, p) in pages.drain(..).enumerate() {
+                        page_request_tx.send((f.clone(), i, p)).unwrap();
+                    }
+                    log::info!("incrementing number of files");
+                    et.num_files_tx.send(1).unwrap();
+                }
+            }
+        }
+
+        for (file, embed) in loaded_files.drain() {
+            et.file_embedding_tx.send((file, embed)).unwrap();
+        }
+
+        et.num_files_tx.send(loaded_files.len() as isize).unwrap();
+    }
+
+    loop {
+        crossbeam_channel::select_biased! {
+            recv(query_embedding_rx) -> res => match res {
+                Ok((q, embedding)) => {
+                    et.query_embedding_tx.send((q, embedding)).unwrap();
+                },
+                Err(err) => {
+                    log::error!("[embedding_thread] Could not receive embedding from worker: {err}. Aborting...");
+                    break
+                },
+            },
+            recv(et.query_request_rx) -> res => match res {
+                Ok(query) => query_request_tx.send(query).unwrap(),
+                Err(err) => {
+                    log::error!("[embedding_thread] Could not receive from query channel: {err}. Aborting...");
+                    break
+                },
+            },
+            recv(et.file_request_rx) -> res => match res {
+                Ok(path) => {
+                    log::info!("Received embedding request for document {}", path.display());
+                    let meta = std::fs::metadata(&path).unwrap();
+                    let modified = meta.modified().unwrap();
+
+                    let mut pages = match embed_anything::embeddings::local::colpali::get_images_from_pdf(&path) {
+                        Ok(pages) => pages,
+                        Err(err) => {
+                            log::error!("Could not render pages of document {}: {err}. Skipping...", path.display());
+                            let doc_data = DocData {last_mtime: modified, page_embeddings: None};
+                            et.file_embedding_tx.send((path.to_string_lossy().to_string(), doc_data)).unwrap();
+                            continue
+                        },
+                    };
+                    let mut page_data = Vec::<Option<Tensor>>::new();
+                    page_data.resize(pages.len(), None);
+                    current_documents.insert(path.clone(), (page_data, modified));
+
+                    for (i, p) in pages.drain(..).enumerate() {
+                        page_request_tx.send((path.clone(), i, p)).unwrap();
+                    }
+                },
+                Err(e) => {
+                    log::error!(
+                    "Error in embedding thread trying to receive from file request channel: {e}. Aborting..."
+                );
+                    break;
+                }
+            },
+            recv(page_embedding_rx) -> res => match res {
+                Ok((path, page_no, embedding)) => {
+                    let finished = {
+                        let Some((embeddings, _)) = current_documents.get_mut(&path) else {
+                            et.num_files_tx.send(-1).unwrap();
+                            log::warn!("[embed_thread] Got embedding for document which has been canceled ({}). Skipping.", path.display());
+                            break
+                        };
+                        embeddings[page_no] = Some(embedding);
+                        embeddings.iter().all(|x| x.is_some())
+                    };
+                    if finished {
+                        let (mut embeddings, modified) = current_documents.remove(&path).expect("we use it just above");
+                        let embeddings = embeddings.drain(..).map(|x| x.expect("we check all are Some above")).collect::<Vec<_>>();
+                        let doc_data = DocData { last_mtime: modified, page_embeddings: Some(PageEmbeddings::from_pages(embeddings)) };
+                        et.file_embedding_tx.send((path.to_string_lossy().to_string(), doc_data)).unwrap();
+                    }
+            }
+                Err(_) => todo!(),
+            }
+        }
+    }
+    let _ = handle.join();
     log::info!("Embed thread finished")
 }
 
 fn new() -> State {
-    let loaded_files = load_saved_embeddings(
-        &std::path::PathBuf::from(&PATHS.embedding_cache_path),
-        &candle_core::Device::Cpu,
-    );
-
     let config: Config = std::fs::File::open(&PATHS.config_path)
         .map_err(|x| anyhow::Error::new(x).context("open config file"))
         .map(BufReader::new)
@@ -1130,12 +1319,14 @@ fn new() -> State {
         .and_then(|x| toml::from_str(x.as_ref()).context("parse configuration"))
         .unwrap_or_default();
     let (et, handles) = EmbedThreadHandles::create();
-    std::thread::spawn(|| embed_thread(et));
 
-    let mut state = State {
+    let rp = config.root_paths.clone();
+    std::thread::spawn(|| embed_thread(et, rp));
+
+    let state = State {
         query: String::new(),
         results: Vec::new(),
-        loaded_files: loaded_files,
+        loaded_files: HashMap::new(),
         handles,
         init_focus: false,
         highlight_index: 0,
@@ -1172,11 +1363,8 @@ fn new() -> State {
         preview_cache: HashMap::new(),
         show_log: false,
         log: Vec::new(),
+        n_docs_total: 0,
     };
-
-    for np in state.config.root_paths.clone().iter() {
-        locate_documents(&mut state, np);
-    }
 
     state
 }
@@ -1241,7 +1429,7 @@ fn load_saved_embeddings(
                         key,
                         DocData {
                             last_mtime: value.last_mtime,
-                            page_embeddings: value.embedding.map(|x| x.into_tensor(device)),
+                            page_embeddings: value.embedding.map(|x| x.into_loaded(device)),
                         },
                     )
                 })
@@ -1256,7 +1444,7 @@ fn load_saved_embeddings(
 fn init_focus() -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::SinkExt;
     stream::channel(100, async |mut output| {
-        output.send(Message::FocusInput).await;
+        output.send(Message::FocusInput).await.unwrap();
     })
 }
 
@@ -1268,6 +1456,16 @@ fn main() -> iced::Result {
             if !state.init_focus {
                 subscriptions.push(Subscription::run(init_focus))
             }
+
+            if state.handles.num_files_rx.len() > 0 {
+                subscriptions.push(Subscription::run(|| {
+                    stream::channel(100, async move |mut output| {
+                        use iced::futures::SinkExt;
+                        output.send(Message::ChangeNTotal).await.unwrap();
+                    })
+                }));
+            }
+
             if state.handles.file_embedding_rx.len() > 0 {
                 let embedded = state.handles.file_embedding_rx.recv().unwrap();
                 subscriptions.push(Subscription::run_with(embedded, |x| {
