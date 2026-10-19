@@ -750,7 +750,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 }
 
 fn results(state: &State) -> Element<'_, Message> {
-    use iced::widget::{column, container, rich_text, row, scrollable, span, text, text_input};
+    use iced::widget::{column, container, rich_text, scrollable, span};
     let palette = state.config.theme.palette();
 
     container(
@@ -760,7 +760,7 @@ fn results(state: &State) -> Element<'_, Message> {
                     .results
                     .iter()
                     .enumerate()
-                    .map(|(i, QueryResult { path, page, score })| {
+                    .map(|(i, QueryResult { path, page, .. })| {
                         let fg = if i == state.highlight_index {
                             palette.success
                         } else {
@@ -909,7 +909,7 @@ fn show_log(state: &State) -> iced::Element<'_, Message> {
 }
 
 fn view(state: &State) -> iced::Element<'_, Message> {
-    use iced::widget::{button, column, container, overlay, row, slider, space, text, text_input};
+    use iced::widget::{button, column, container, row, space, text, text_input};
     let Config {
         text_height: th,
         padding: pad,
@@ -917,7 +917,7 @@ fn view(state: &State) -> iced::Element<'_, Message> {
         viewer: _,
         theme: _,
         root_paths: _,
-        show_preview,
+        show_preview: _,
     } = state.config;
 
     let ti = container(
@@ -1069,7 +1069,7 @@ impl EmbedThreadHandles {
 fn embed_single_page(
     image: DynamicImage,
     embedder: &ColSmolEmbedder,
-) -> Result<(Tensor), anyhow::Error> {
+) -> Result<Tensor, anyhow::Error> {
     let (input_ids, attention_mask, pixel_values, pixel_attention_mask) = embedder
         .processor
         .preprocess(&[image], &embedder.device)
