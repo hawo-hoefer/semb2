@@ -830,16 +830,16 @@ fn config_editor(state: &State) -> iced::Element<'_, Message> {
             space().width(4.0 * spc),
             centered_text("Text Size", pad, th),
             space().width(spc),
-            slider(5.0..=50.0, th, Message::SetTextHeight)
+            slider(3.0..=50.0, th, Message::SetTextHeight)
         ),
         row!(
             centered_text("Spacing", pad, th),
             space().width(spc),
-            slider(5.0..=50.0, spc, Message::SetSpacing),
+            slider(1.0..=50.0, spc, Message::SetSpacing),
             space().width(4.0 * spc),
             centered_text("Padding", pad, th),
             space().width(spc),
-            slider(5.0..=50.0, pad, Message::SetPadding)
+            slider(1.0..=50.0, pad, Message::SetPadding)
         ),
         row!(
             centered_text("Show Page Preview", pad, th),
