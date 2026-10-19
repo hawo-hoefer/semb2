@@ -1041,7 +1041,7 @@ fn new() -> State {
     let device = embed_model.device.clone();
     let loaded_files = load_saved_embeddings(
         &std::path::PathBuf::from(&PATHS.embedding_cache_path),
-        &device,
+        &candle_core::Device::Cpu,
     );
     let config: Config = std::fs::File::open(&PATHS.config_path)
         .map_err(|x| anyhow::Error::new(x).context("open config file"))
