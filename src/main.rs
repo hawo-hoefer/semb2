@@ -1226,11 +1226,12 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
             }
         }
 
+        et.num_files_tx.send(loaded_files.len() as isize).unwrap();
+
         for (file, embed) in loaded_files.drain() {
             et.file_embedding_tx.send((file, embed)).unwrap();
         }
 
-        et.num_files_tx.send(loaded_files.len() as isize).unwrap();
     }
 
     loop {
