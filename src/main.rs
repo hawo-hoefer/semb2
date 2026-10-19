@@ -73,7 +73,10 @@ fn embed_file(
     let mut embed_data = Vec::new();
     let n_batches = (pages.len() as f32 / batch_size as f32).ceil() as usize;
     for (i, batch) in pages.chunks(batch_size).enumerate() {
-        log::info!("Embedding batch {i} / {n_batches} of {}", file_path.display());
+        log::info!(
+            "Embedding batch {i} / {n_batches} of {}",
+            file_path.display()
+        );
         // let start_page = index * batch_size + 1;
         // let end_page = start_page + batch.len();
         // let page_numbers = (start_page..=end_page).collect::<Vec<_>>();
@@ -95,7 +98,10 @@ fn embed_file(
             .context("Error in running model")?
             .to_dtype(DType::F32)?;
 
-        let image_embeddings = image_embeddings.unsqueeze(0)?.avg_pool2d((2, 1))?;
+        let image_embeddings = image_embeddings
+            .unsqueeze(0)?
+            .avg_pool2d((2, 1))?
+            .squeeze(0)?;
 
         embed_data.push(image_embeddings);
     }
@@ -1154,7 +1160,6 @@ fn load_saved_embeddings(
         .map(|v| {
             v.into_iter()
                 .map(|(key, value)| {
-                    dbg!(&value.page_embedding_shape);
                     (
                         key,
                         DocData {
