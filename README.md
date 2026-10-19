@@ -16,3 +16,5 @@ $ cargo install --path .
 - [ ] make double query to open work again
 - [x] add status messages
 - [x] add placeholders for files which errored during loading so we don't have to load them again
+- [ ] regularily update progress bar instead of only on-focus
+- [ ] log is only shown if results are present
