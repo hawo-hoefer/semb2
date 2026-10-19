@@ -13,3 +13,4 @@ $ cargo install --path .
 - [ ] Robustness: fix all uses of unwrap
 - [ ] dampen dependency hell a bit
 - [ ] make double query to open work again
+- [ ] add status messages
