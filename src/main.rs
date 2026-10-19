@@ -71,7 +71,9 @@ fn embed_file(
 ) -> Result<Tensor, anyhow::Error> {
     let pages = embed_anything::embeddings::local::colpali::get_images_from_pdf(&file_path)?;
     let mut embed_data = Vec::new();
-    for batch in pages.chunks(batch_size) {
+    let n_batches = (pages.len() as f32 / batch_size as f32).ceil() as usize;
+    for (i, batch) in pages.chunks(batch_size).enumerate() {
+        log::info!("Embedding batch {i} / {n_batches} of {}", file_path.display());
         // let start_page = index * batch_size + 1;
         // let end_page = start_page + batch.len();
         // let page_numbers = (start_page..=end_page).collect::<Vec<_>>();
@@ -92,6 +94,9 @@ fn embed_file(
             )
             .context("Error in running model")?
             .to_dtype(DType::F32)?;
+
+        let image_embeddings = image_embeddings.unsqueeze(0)?.avg_pool2d((2, 1))?;
+
         embed_data.push(image_embeddings);
     }
 
@@ -507,6 +512,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::QueryProcessed(query, embedding) => {
+            state.last_query = query;
+
             state.highlight_index = 0;
             state.results.clear();
             for (path, v) in state.loaded_files.iter() {
@@ -525,7 +532,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     })
                 }
             }
-            state.last_query = query;
+
             state
                 .results
                 .sort_by(|a, b| f32::total_cmp(&b.score, &a.score));
@@ -759,6 +766,11 @@ fn config_editor(state: &State) -> iced::Element<'_, Message> {
     column!(
         row!(
             button(text("❌").center().size(th)).on_press(Message::ToggleConfig),
+            space().width(Fill),
+            centered_text("Settings", pad, th),
+            space().width(Fill),
+        ),
+        row!(
             space().width(spc),
             centered_text("Select Theme", pad, th),
             space().width(spc),
@@ -768,9 +780,8 @@ fn config_editor(state: &State) -> iced::Element<'_, Message> {
                 Some(&(&state.config.theme).try_into().unwrap()),
                 Message::SetTheme,
             )
-            .size(th)
-        ),
-        row!(
+            .size(th),
+            space().width(4.0 * spc),
             centered_text("Text Size", pad, th),
             space().width(spc),
             slider(5.0..=50.0, th, Message::SetTextHeight)
@@ -778,9 +789,8 @@ fn config_editor(state: &State) -> iced::Element<'_, Message> {
         row!(
             centered_text("Spacing", pad, th),
             space().width(spc),
-            slider(5.0..=50.0, spc, Message::SetSpacing)
-        ),
-        row!(
+            slider(5.0..=50.0, spc, Message::SetSpacing),
+            space().width(4.0 * spc),
             centered_text("Padding", pad, th),
             space().width(spc),
             slider(5.0..=50.0, pad, Message::SetPadding)
@@ -800,9 +810,8 @@ fn config_editor(state: &State) -> iced::Element<'_, Message> {
                 &state.config.viewer.program_name
             )
             .size(th)
-            .on_input(Message::SetViewerProgram)
-        ),
-        row!(
+            .on_input(Message::SetViewerProgram),
+            space().width(4.0 * spc),
             centered_text("Viewer Page Argument", pad, th),
             space().width(state.config.spacing),
             text_input(
@@ -1145,6 +1154,7 @@ fn load_saved_embeddings(
         .map(|v| {
             v.into_iter()
                 .map(|(key, value)| {
+                    dbg!(&value.page_embedding_shape);
                     (
                         key,
                         DocData {
