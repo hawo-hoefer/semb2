@@ -132,17 +132,35 @@ const PREALLOC_SIZE_LIMIT: usize = 8 * 1024 * 1024 * 1024;
 type Max8GB = BincodeLen<PREALLOC_SIZE_LIMIT>;
 
 #[derive(wincode::SchemaRead, wincode::SchemaWrite)]
+struct SavedEmbedding {
+    #[wincode(with = "wincode::containers::Vec<f32, Max8GB>")]
+    data: Vec<f32>,
+    shape: Vec<usize>,
+}
+
+impl SavedEmbedding {
+    pub fn new(data: Tensor) -> Self {
+        Self {
+            data: data.flatten_all().unwrap().to_vec1().unwrap(),
+            shape: data.shape().clone().into_dims(),
+        }
+    }
+
+    fn into_tensor(self, device: &candle_core::Device) -> Tensor {
+        Tensor::from_vec(self.data, self.shape, device).unwrap()
+    }
+}
+
+#[derive(wincode::SchemaRead, wincode::SchemaWrite)]
 struct SavedDocData {
     last_mtime: SystemTime,
-    #[wincode(with = "wincode::containers::Vec<f32, Max8GB>")]
-    page_embeddings: Vec<f32>,
-    page_embedding_shape: Vec<usize>,
+    embedding: Option<SavedEmbedding>,
 }
 
 #[derive(Clone, Debug)]
 struct DocData {
     last_mtime: SystemTime,
-    page_embeddings: Tensor,
+    page_embeddings: Option<Tensor>,
 }
 
 impl Hash for DocData {
@@ -462,15 +480,9 @@ fn save_embeddings(embeddings: &HashMap<String, DocData>) -> Result<(), anyhow::
                                     file,
                                     SavedDocData {
                                         last_mtime: last_mtime.clone(),
-                                        page_embedding_shape: page_embeddings
-                                            .shape()
-                                            .clone()
-                                            .into_dims(),
-                                        page_embeddings: page_embeddings
-                                            .flatten_all()
-                                            .unwrap()
-                                            .to_vec1()
-                                            .unwrap(),
+                                        embedding: page_embeddings
+                                            .as_ref()
+                                            .map(|x| SavedEmbedding::new(x.clone())),
                                     },
                                 )
                             },
@@ -517,19 +529,22 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.query = s;
             Task::none()
         }
-        Message::QueryProcessed(query, embedding) => {
+        Message::QueryProcessed(query, query_embedding) => {
             state.last_query = query;
 
             state.highlight_index = 0;
             state.results.clear();
             for (path, v) in state.loaded_files.iter() {
-                let scores = max_sim(
-                    &embedding.to_device(&state.device).unwrap(),
-                    &v.page_embeddings.to_device(&state.device).unwrap(),
-                )
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
+                let Some(ref doc_embedding) = v.page_embeddings else {
+                    continue;
+                };
+
+                // TODO: think about moving this back to the GPU if it's too slow
+                let scores = max_sim(&query_embedding, &doc_embedding)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+
                 for (i, score) in scores.into_iter().enumerate() {
                     state.results.push(QueryResult {
                         path: path.to_string(),
@@ -1022,13 +1037,13 @@ fn embed_thread(et: EmbedThread) {
                 let modified = meta.modified().unwrap();
 
                 let embedded = match embed_file(&et.model, path.clone(), 1).and_then(normalize) {
-                    Ok(embedded) => embedded,
+                    Ok(embedded) => Some(embedded.to_device(&candle_core::Device::Cpu).unwrap()),
                     Err(e) => {
                         log::error!("Could not embed file {}. If there is a size mismatch, this is likely due to varying page sizes. Error: {e}", path.display());
-                        continue
+                        None
                     },
                 };
-                et.file_embedding_tx.send((path.to_string_lossy().to_string(), DocData { last_mtime: modified, page_embeddings: embedded.to_device(&candle_core::Device::Cpu).unwrap() })).unwrap();
+                et.file_embedding_tx.send((path.to_string_lossy().to_string(), DocData { last_mtime: modified, page_embeddings: embedded })).unwrap();
             }
         }
     }
@@ -1164,12 +1179,7 @@ fn load_saved_embeddings(
                         key,
                         DocData {
                             last_mtime: value.last_mtime,
-                            page_embeddings: Tensor::from_vec(
-                                value.page_embeddings,
-                                value.page_embedding_shape,
-                                device,
-                            )
-                            .unwrap(),
+                            page_embeddings: value.embedding.map(|x| x.into_tensor(device)),
                         },
                     )
                 })
@@ -1210,6 +1220,7 @@ fn main() -> iced::Result {
                     })
                 }))
             }
+
             subscriptions.push(iced::keyboard::listen().filter_map(|x| match x {
                 iced::keyboard::Event::KeyPressed {
                     key,
