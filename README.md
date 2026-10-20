@@ -21,3 +21,4 @@ $ cargo install --path .
 - [ ] regularily update progress bar instead of only on-focus
 - [x] log is only shown if results are present
 - [x] limiting memory consumption causes embedding thread to block on trying to send to queue. fix
+- [ ] improve search performance using HNSWlib
