@@ -1110,10 +1110,6 @@ fn embed_worker(
 ) {
     let embedder = load_model();
 
-    let mut s = crossbeam_channel::Select::new_biased();
-    s.recv(&query_rx);
-    s.recv(&page_rx);
-
     loop {
         crossbeam_channel::select_biased! {
             recv(&query_rx) -> res => match res {
@@ -1179,6 +1175,11 @@ fn handle_file_request(
     current_documents.insert(path.as_ref().to_path_buf(), (page_data, modified));
 
     for (i, p) in pages.drain(..).enumerate() {
+        log::info!(
+            "Sending page embed request for page {}/{n_pages} of {}",
+            i,
+            path.as_ref().display()
+        );
         page_request_tx
             .send((path.as_ref().to_path_buf(), i, n_pages, p))
             .unwrap();
@@ -1190,18 +1191,19 @@ fn handle_file_request(
 fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
     let mut current_documents: HashMap<PathBuf, (Vec<Option<Tensor>>, SystemTime)> = HashMap::new();
     let (query_request_tx, query_request_rx) = crossbeam_channel::unbounded();
-    let (page_request_tx, page_request_rx) = crossbeam_channel::bounded(500);
+    let (page_request_tx, page_request_rx) = crossbeam_channel::unbounded();
     let (query_embedding_tx, query_embedding_rx) = crossbeam_channel::unbounded();
     let (page_embedding_tx, page_embedding_rx) = crossbeam_channel::unbounded();
     let (own_file_request_tx, own_file_request_rx) = crossbeam_channel::unbounded::<PathBuf>();
 
     let lt = et.log_tx.clone();
+    let pt = page_embedding_tx.clone();
     let handle = std::thread::spawn(|| {
         embed_worker(
             query_request_rx,
             page_request_rx,
             query_embedding_tx,
-            page_embedding_tx,
+            pt,
             lt,
         )
     });
@@ -1255,71 +1257,114 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
     }
 
     loop {
-        crossbeam_channel::select_biased! {
-            recv(query_embedding_rx) -> res => match res {
-                Ok((q, embedding)) => {
-                    et.query_embedding_tx.send((q, embedding)).unwrap();
-                },
+        log::info!(
+            "Current page embeddings queue size: {}",
+            &page_request_tx.len()
+        );
+
+        let mut select = crossbeam_channel::Select::new_biased();
+        select.recv(&query_embedding_rx);
+        select.recv(&et.query_request_rx);
+        select.recv(&page_embedding_rx);
+
+        let file_request_receivers = if page_request_tx.len() < 500 {
+            select.recv(&own_file_request_rx);
+            select.recv(&et.file_request_rx);
+            Some([&own_file_request_rx, &et.file_request_rx])
+        } else {
+            None
+        };
+
+        let op = select.select();
+
+        match op.index() {
+            0 => match op.recv(&query_embedding_rx) {
+                Ok(qe) => et.query_embedding_tx.send(qe).unwrap(),
                 Err(err) => {
-                    log::error!("[embedding_thread] Could not receive embedding from worker: {err}. Aborting...");
-                    break
-                },
+                    log::error!(
+                        "[embed_thread] could not receive query embedding: {err}. Aborting"
+                    );
+                    break;
+                }
             },
-            recv(et.query_request_rx) -> res => match res {
-                Ok(query) => query_request_tx.send(query).unwrap(),
+            1 => match op.recv(&et.query_request_rx) {
+                Ok(q) => query_request_tx.send(q).unwrap(),
                 Err(err) => {
-                    log::error!("[embedding_thread] Could not receive from query channel: {err}. Aborting...");
-                    break
-                },
+                    log::error!(
+                        "[embed_thread] could not receive query embedding request: {err}. Aborting"
+                    );
+                    break;
+                }
             },
-            recv(page_embedding_rx) -> res => match res {
+            2 => match op.recv(&page_embedding_rx) {
                 Ok((path, page_no, embedding)) => {
                     let finished = {
                         let Some((embeddings, _)) = current_documents.get_mut(&path) else {
                             et.num_files_tx.send(-1).unwrap();
-                            log::warn!("[embed_thread] Got embedding for document which has been canceled ({}). Skipping.", path.display());
-                            break
+                            log::warn!(
+                                "[embed_thread] Got embedding for document which has been canceled ({}). Skipping.",
+                                path.display()
+                            );
+                            break;
                         };
                         embeddings[page_no] = Some(embedding);
                         embeddings.iter().all(|x| x.is_some())
                     };
                     if finished {
-                        let (mut embeddings, modified) = current_documents.remove(&path).expect("we use it just above");
-                        let embeddings = embeddings.drain(..).map(|x| x.expect("we check all are Some above")).collect::<Vec<_>>();
-                        let doc_data = DocData { last_mtime: modified, page_embeddings: Some(PageEmbeddings::from_pages(embeddings)) };
-                        et.file_embedding_tx.send((path.to_string_lossy().to_string(), doc_data)).unwrap();
+                        let (mut embeddings, modified) = current_documents
+                            .remove(&path)
+                            .expect("we use it just above");
+                        let embeddings = embeddings
+                            .drain(..)
+                            .map(|x| x.expect("we check all are Some above"))
+                            .collect::<Vec<_>>();
+                        let doc_data = DocData {
+                            last_mtime: modified,
+                            page_embeddings: Some(PageEmbeddings::from_pages(embeddings)),
+                        };
+                        et.file_embedding_tx
+                            .send((path.to_string_lossy().to_string(), doc_data))
+                            .unwrap();
                     }
+                }
+                Err(err) => {
+                    log::error!(
+                        "[embed_thread] could not receive page embedding request: {err}. Aborting"
+                    );
+                    break;
+                }
+            },
+            x if x == 3 || x == 4 => {
+                let file_request_receivers = file_request_receivers
+                    .expect("this branch can only happen if we have file requests in select");
+                match op.recv(file_request_receivers[x - 3]) {
+                    Ok(path) => {
+                        log::info!("Received embedding request for document {}", path.display());
+                        if !handle_file_request(
+                            &path,
+                            &et.file_embedding_tx,
+                            &page_request_tx,
+                            &mut current_documents,
+                        ) {
+                            send_log(
+                                &et.log_tx,
+                                format!(
+                                    "Skipped file {} due to error in page processing.",
+                                    path.display()
+                                ),
+                            )
+                            .unwrap();
+                        };
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Error in embedding thread trying to receive from file request channel: {e}. Aborting"
+                        );
+                        break;
+                    }
+                }
             }
-                Err(_) => todo!(),
-            },
-            recv(own_file_request_rx) -> res => match res {
-                Ok(path) => {
-                    log::info!("Received embedding request for document {}", path.display());
-                    if !handle_file_request(&path, &et.file_embedding_tx, &page_request_tx,  &mut current_documents) {
-                        send_log(&et.log_tx, format!("Skipped file {} due to error in page processing.", path.display())).unwrap();
-                    };
-                },
-                Err(e) => {
-                    log::error!(
-                    "Error in embedding thread trying to receive from file request channel: {e}. Aborting..."
-                );
-                    break;
-                }
-            },
-            recv(et.file_request_rx) -> res => match res {
-                Ok(path) => {
-                    log::info!("Received embedding request for document {}", path.display());
-                    if !handle_file_request(&path, &et.file_embedding_tx, &page_request_tx,  &mut current_documents) {
-                        send_log(&et.log_tx, format!("Skipped file {} due to error in page processing.", path.display())).unwrap();
-                    };
-                },
-                Err(e) => {
-                    log::error!(
-                    "Error in embedding thread trying to receive from file request channel: {e}. Aborting..."
-                );
-                    break;
-                }
-            },
+            _ => unreachable!(),
         }
     }
     let _ = handle.join();
