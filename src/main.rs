@@ -1146,7 +1146,7 @@ fn embed_worker(
 fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
     let mut current_documents = HashMap::new();
     let (query_request_tx, query_request_rx) = crossbeam_channel::unbounded();
-    let (page_request_tx, page_request_rx) = crossbeam_channel::unbounded();
+    let (page_request_tx, page_request_rx) = crossbeam_channel::bounded(500);
     let (query_embedding_tx, query_embedding_rx) = crossbeam_channel::unbounded();
     let (page_embedding_tx, page_embedding_rx) = crossbeam_channel::unbounded();
 
