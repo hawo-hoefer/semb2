@@ -194,6 +194,7 @@ struct State {
     config: Config,
     show_config: bool,
     show_log: bool,
+    show_documents: bool,
     n_docs_total: usize,
     config_editor: ConfigEditorState,
     preview_cache: HashMap<(String, usize), iced::widget::image::Handle>,
@@ -434,6 +435,7 @@ enum Message {
     AddRootPath,
     RemoveSearchPath(usize),
     ToggleShowPreview,
+    ToggleDocuments,
     NewLogMessage,
     ChangeNTotal,
 }
@@ -753,6 +755,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
             Task::none()
         }
+        Message::ToggleDocuments => {
+            state.show_documents = !state.show_documents;
+
+            Task::none()
+        }
     }
 }
 
@@ -902,13 +909,50 @@ fn config_editor(state: &State) -> iced::Element<'_, Message> {
 }
 
 fn show_log(state: &State) -> iced::Element<'_, Message> {
-    use iced::widget::{column, container, scrollable, text};
+    use iced::widget::{column, container, scrollable, text, space};
+    let palette = state.config.theme.palette();
 
-    container(
+    container(column!(
+        text("Log").color(palette.primary),
+        space().height(state.config.spacing),
         scrollable(column(state.log.iter().rev().map(|x| {
             text(format!("[{}] {}", x.time.format("%H:%M:%S"), x.msg)).into()
         })))
-        .height(state.log.len().min(3) as f32 * (state.config.text_height + state.config.padding))
+        .height(10.0 * (state.config.text_height + state.config.padding))
+        .width(Fill),
+    ))
+    .padding(state.config.padding)
+    .into()
+}
+
+fn show_documents(state: &State) -> iced::Element<'_, Message> {
+    use iced::widget::{column, container, scrollable, text, space};
+    let palette = state.config.theme.palette();
+    container(
+        scrollable(column!(
+            text("Loaded Documents").color(palette.primary),
+            space().height(state.config.spacing),
+            column(state.loaded_files.iter().map(|(path, doc_data)| {
+                use safetensors::View;
+                let mtime: chrono::DateTime<chrono::Local> = doc_data.last_mtime.into();
+                let n_pages = doc_data
+                    .page_embeddings
+                    .as_ref()
+                    .map(|x| x.page_sizes.len())
+                    .unwrap_or(0);
+                let size = doc_data
+                    .page_embeddings
+                    .as_ref()
+                    .map(|x| x.data.data_len() as f32 / (1024 * 1024) as f32)
+                    .unwrap_or(0.0);
+                text(format!(
+                    "[{}] {n_pages} Pages ({size:.1} MB) {path}",
+                    mtime.format("%d.%m.%y %H:%M:%S")
+                ))
+                .into()
+            }))
+        ))
+        .height(10.0 * (state.config.text_height + state.config.padding))
         .width(Fill),
     )
     .padding(state.config.padding)
@@ -916,7 +960,7 @@ fn show_log(state: &State) -> iced::Element<'_, Message> {
 }
 
 fn view(state: &State) -> iced::Element<'_, Message> {
-    use iced::widget::{button, column, container, row, space, text, text_input};
+    use iced::widget::{button, column, container, row, rule, space, text, text_input};
     let Config {
         text_height: th,
         padding: pad,
@@ -965,7 +1009,11 @@ fn view(state: &State) -> iced::Element<'_, Message> {
     .into();
 
     if state.show_log {
-        c = column!(c, space().height(spc / 4.0), show_log(state)).into();
+        c = column!(c, rule::horizontal(spc / 4.0), show_log(state)).into();
+    }
+
+    if state.show_documents {
+        c = column!(c, rule::horizontal(spc / 4.0), show_documents(state)).into();
     }
 
     if state.show_config {
@@ -1434,6 +1482,7 @@ fn new() -> State {
         show_log: false,
         log: Vec::new(),
         n_docs_total: 0,
+        show_documents: false,
     };
 
     state
@@ -1567,6 +1616,8 @@ fn main() -> iced::Result {
                         Some(Message::FocusInput)
                     } else if key == Key::Character("m".into()) && modifiers.control() {
                         Some(Message::ToggleLog)
+                    } else if key == Key::Character("d".into()) && modifiers.control() {
+                        Some(Message::ToggleDocuments)
                     } else {
                         None
                     }

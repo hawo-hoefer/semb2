@@ -6559,6 +6559,7 @@ dependencies = [
  "lazy_static",
  "log",
  "pdf2image",
+ "safetensors 0.8.0",
  "serde",
  "toml",
  "walkdir",
