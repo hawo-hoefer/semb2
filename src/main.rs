@@ -84,9 +84,24 @@ struct SavedEmbedding {
 
 impl SavedEmbedding {
     pub fn new(embeddings: PageEmbeddings) -> Self {
+        let shape = embeddings
+            .data
+            .i((..embeddings.allocated_chunks, ..))
+            .unwrap()
+            .shape()
+            .clone()
+            .into_dims();
+
         Self {
-            data: embeddings.data.flatten_all().unwrap().to_vec1().unwrap(),
-            shape: embeddings.data.shape().clone().into_dims(),
+            data: embeddings
+                .data
+                .i((..embeddings.allocated_chunks, ..))
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap(),
+            shape,
             page_sizes: embeddings.page_sizes,
             page_numbers: embeddings.page_numbers,
             total_pages: embeddings.total_pages,
@@ -130,13 +145,11 @@ impl PageEmbeddings {
         let n_chunks = page.dim(0).unwrap();
         let embed_dim = page.dim(1).unwrap();
 
-        let data = unsafe {
-            Tensor::empty(
-                (n_chunks * 4, embed_dim),
-                page.dtype(),
-                &candle_core::Device::Cpu,
-            )
-        }
+        let data = Tensor::zeros(
+            (n_chunks * 4, embed_dim),
+            page.dtype(),
+            &candle_core::Device::Cpu,
+        )
         .unwrap();
 
         data.slice_set(page, 0, 0).unwrap();
@@ -190,18 +203,16 @@ impl PageEmbeddings {
         if self.allocated_chunks + added_size > capacity {
             // reallocate
 
-            // SAFETY: we set the contents after and only ever use up until self.allocated_chunks
-            // of the data. new_capacity needs to be at least self.allocated_chunks + added_size,
+            // we only ever use up until self.allocated_chunks of the tensor.
+            // new_capacity needs to be at least self.allocated_chunks + added_size,
             // otherwise self.data.slice_set will fail
             let new_capacity = (capacity * 2).max(self.allocated_chunks + added_size);
-            let mut v = unsafe {
-                Tensor::empty(
-                    (new_capacity, embed_dim),
-                    self.data.dtype(),
-                    &candle_core::Device::Cpu,
-                )
-                .unwrap()
-            };
+            let mut v = Tensor::zeros(
+                (new_capacity, embed_dim),
+                self.data.dtype(),
+                &candle_core::Device::Cpu,
+            )
+            .unwrap();
             std::mem::swap(&mut self.data, &mut v);
 
             self.data
