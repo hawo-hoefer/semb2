@@ -957,6 +957,10 @@ fn view(state: &State) -> iced::Element<'_, Message> {
     .padding(state.config.padding)
     .into();
 
+    if state.show_log {
+        c = column!(c, space().height(spc / 4.0), show_log(state)).into();
+    }
+
     if state.show_config {
         let editor = config_editor(state);
         c = column!(editor, c).into();
@@ -976,10 +980,6 @@ fn view(state: &State) -> iced::Element<'_, Message> {
                 ))
                 .into()
             });
-
-        if state.show_log {
-            c = column!(c, space().height(spc / 4.0), show_log(state)).into();
-        }
 
         c = row!(
             c,
@@ -1101,7 +1101,7 @@ fn embed_single_page(
 
 fn embed_worker(
     query_rx: crossbeam_channel::Receiver<String>,
-    page_rx: crossbeam_channel::Receiver<(PathBuf, usize, DynamicImage)>,
+    page_rx: crossbeam_channel::Receiver<(PathBuf, usize, usize, DynamicImage)>,
     query_tx: crossbeam_channel::Sender<(String, Tensor)>,
     page_tx: crossbeam_channel::Sender<(PathBuf, usize, Tensor)>,
     log_tx: crossbeam_channel::Sender<LogMessage>,
@@ -1129,9 +1129,9 @@ fn embed_worker(
                 }
             },
             recv(&page_rx) -> res => match res {
-                Ok((path, page_no, image)) => {
+                Ok((path, page_no, n_pages, image)) => {
                     let embedding = embed_single_page(image, &embedder).unwrap().squeeze(0).unwrap();
-                    let _ = send_log(&log_tx, format!("Embedding Page {} of {}", page_no + 1, path.display())).unwrap();
+                    let _ = send_log(&log_tx, format!("Embedding Page {}/{} of {}", page_no + 1, n_pages, path.display())).unwrap();
                     let _ = page_tx.send((path, page_no, embedding.to_device(&candle_core::Device::Cpu).unwrap())).unwrap();
                 }
                 Err(e) => {
@@ -1216,11 +1216,12 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
                         };
 
                     let mut page_data = Vec::<Option<Tensor>>::new();
-                    page_data.resize(pages.len(), None);
+                    let n_pages = pages.len();
+                    page_data.resize(n_pages, None);
                     current_documents.insert(f.clone(), (page_data, modified));
 
                     for (i, p) in pages.drain(..).enumerate() {
-                        page_request_tx.send((f.clone(), i, p)).unwrap();
+                        page_request_tx.send((f.clone(), i, n_pages, p)).unwrap();
                     }
                     log::info!("incrementing number of files");
                     et.num_files_tx.send(1).unwrap();
@@ -1269,11 +1270,12 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
                         },
                     };
                     let mut page_data = Vec::<Option<Tensor>>::new();
-                    page_data.resize(pages.len(), None);
+                    let n_pages = pages.len();
+                    page_data.resize(n_pages, None);
                     current_documents.insert(path.clone(), (page_data, modified));
 
                     for (i, p) in pages.drain(..).enumerate() {
-                        page_request_tx.send((path.clone(), i, p)).unwrap();
+                        page_request_tx.send((path.clone(), i, n_pages, p)).unwrap();
                     }
                 },
                 Err(e) => {
