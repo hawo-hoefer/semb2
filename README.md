@@ -1,4 +1,4 @@
-# semb2
+# semb2reamde
 
 local embedding search powered py ColPali / ColSmol
 
@@ -10,6 +10,8 @@ $ cargo install --path .
 ## Roadmap
 - [x] add previewing of pages when tabbing through results
 - [x] improve asynchronous model loading
+- [x] allow partial document saves
+- [ ] separately load embeddings and metadata. this should allow better asynchronous loading with even lower initial waiting times
 - [ ] make embeddings loadable per-file somehow to improve async loading even more
 - [ ] Robustness: fix all uses of unwrap
 - [ ] dampen dependency hell a bit
