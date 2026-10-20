@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use iced::widget::image::Handle;
 use iced::widget::operation::AbsoluteOffset;
 use iced::{Element, Subscription, Task, Theme, stream};
 use image::DynamicImage;
+use pdf2image::PDF;
 use serde::Serialize;
 use wincode::len::BincodeLen;
 
@@ -78,6 +79,8 @@ struct SavedEmbedding {
     data: Vec<f32>,
     shape: Vec<usize>,
     page_sizes: Vec<usize>,
+    page_numbers: Vec<usize>,
+    total_pages: usize,
 }
 
 impl SavedEmbedding {
@@ -86,14 +89,19 @@ impl SavedEmbedding {
             data: embeddings.data.flatten_all().unwrap().to_vec1().unwrap(),
             shape: embeddings.data.shape().clone().into_dims(),
             page_sizes: embeddings.page_sizes,
+            page_numbers: embeddings.page_numbers,
+            total_pages: embeddings.total_pages,
         }
     }
 
     fn into_loaded(self, device: &candle_core::Device) -> PageEmbeddings {
         let embeddings = Tensor::from_vec(self.data, self.shape, device).unwrap();
         PageEmbeddings {
-            data: embeddings,
             page_sizes: self.page_sizes,
+            page_numbers: self.page_numbers,
+            allocated_chunks: embeddings.dim(0).unwrap(),
+            total_pages: self.total_pages,
+            data: embeddings,
         }
     }
 }
@@ -108,17 +116,50 @@ struct SavedDocData {
 struct PageEmbeddings {
     /// [of shape n_chunks, embed_dim]
     data: Tensor,
+    allocated_chunks: usize,
+
     /// sizes in data [dim 0]. page 0 is data[0..page_sizes[0]], etc
     page_sizes: Vec<usize>,
+    /// page numbers for pages in page_sizes
+    page_numbers: Vec<usize>,
+    /// total number of pages
+    total_pages: usize,
 }
 
 impl PageEmbeddings {
-    fn from_pages(pages: Vec<Tensor>) -> Self {
+    fn from_single_page(page: &Tensor, page_num: usize, total_pages: usize) -> Self {
+        let n_chunks = page.dim(0).unwrap();
+        let embed_dim = page.dim(1).unwrap();
+
+        let data = unsafe {
+            Tensor::empty(
+                (n_chunks * 4, embed_dim),
+                page.dtype(),
+                &candle_core::Device::Cpu,
+            )
+        }
+        .unwrap();
+
+        data.slice_set(page, 0, 0).unwrap();
+
+        Self {
+            data: data,
+            allocated_chunks: n_chunks,
+            page_sizes: vec![n_chunks],
+            page_numbers: vec![page_num],
+            total_pages,
+        }
+    }
+
+    fn from_pages(pages: Vec<Tensor>, page_numbers: Vec<usize>, total_pages: usize) -> Self {
         let sizes = pages.iter().map(|x| x.dim(0).unwrap()).collect();
         let embeddings = Tensor::cat(&pages, 0).expect("have same first dim");
         Self {
-            data: embeddings,
             page_sizes: sizes,
+            page_numbers: page_numbers,
+            allocated_chunks: embeddings.dim(0).unwrap(),
+            data: embeddings,
+            total_pages,
         }
     }
 
@@ -137,6 +178,8 @@ impl PageEmbeddings {
         let mut start = 0;
         let mut scores = Vec::with_capacity(self.page_sizes.len());
         for p in self.page_sizes.iter() {
+            assert!(start + p <= self.allocated_chunks);
+
             scores.push(
                 dot_product
                     .i((.., start..start + p))?
@@ -149,12 +192,59 @@ impl PageEmbeddings {
 
         Ok(scores)
     }
+
+    fn push_page(&mut self, page: &Tensor, page_no: usize) {
+        let added_size = page.dim(0).unwrap();
+        let capacity = self.data.dim(0).unwrap();
+        let embed_dim = self.data.dim(1).unwrap();
+
+        assert!(!self.page_numbers.contains(&page_no));
+
+        if self.allocated_chunks + added_size > capacity {
+            // reallocate
+
+            // SAFETY: we set the contents after and only ever use up until self.allocated_chunks
+            // of the data. new_capacity needs to be at least self.allocated_chunks + added_size,
+            // otherwise self.data.slice_set will fail
+            let new_capacity = (capacity * 2).max(self.allocated_chunks + added_size);
+            let mut v = unsafe {
+                Tensor::empty(
+                    (new_capacity, embed_dim),
+                    self.data.dtype(),
+                    &candle_core::Device::Cpu,
+                )
+                .unwrap()
+            };
+            std::mem::swap(&mut self.data, &mut v);
+
+            self.data
+                .slice_set(&v.i((..self.allocated_chunks, ..)).unwrap(), 0, 0)
+                .unwrap();
+        }
+
+        // happy path
+        self.data
+            .slice_set(&page, 0, self.allocated_chunks)
+            .unwrap();
+        self.allocated_chunks += added_size;
+        self.page_sizes.push(added_size);
+        self.page_numbers.push(page_no);
+    }
 }
 
 #[derive(Clone, Debug)]
 struct DocData {
     last_mtime: SystemTime,
     page_embeddings: Option<PageEmbeddings>,
+}
+
+impl DocData {
+    pub fn is_complete(&self) -> bool {
+        self.page_embeddings
+            .as_ref()
+            .map(|x| x.total_pages == x.page_numbers.len())
+            .unwrap_or(true)
+    }
 }
 
 impl Hash for DocData {
@@ -419,7 +509,7 @@ enum Message {
     InputChanged(String),
     RunQuery,
     QueryProcessed(String, Tensor),
-    DocumentProcessed,
+    PageProcessed,
     ToggleLog,
     FocusInput,
     ToggleConfig,
@@ -543,7 +633,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 // TODO: think about moving this back to the GPU if it's too slow
                 let scores = doc_embedding.compute_max_sim(&query_embedding).unwrap();
 
-                for (i, score) in scores.into_iter().enumerate() {
+                for (score, i) in scores.into_iter().zip(&doc_embedding.page_numbers) {
                     state.results.push(QueryResult {
                         path: path.to_string(),
                         page: i + 1,
@@ -592,21 +682,85 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 )
             }
         }
-        Message::DocumentProcessed => {
-            for (path, doc_data) in state.handles.file_embedding_rx.try_iter() {
-                log::info!("Finished processing {path}");
-                if state
-                    .config
-                    .root_paths
-                    .iter()
-                    .map(|x| x.to_string_lossy().to_string())
-                    .any(|x| path.starts_with(&x))
-                {
-                    state.loaded_files.insert(path, doc_data);
-                } else {
-                    log::info!(
-                        "Skipping adding of file {path} to loaded files. No longer matches a root path"
-                    );
+        Message::PageProcessed => {
+            for p in state.handles.file_embedding_rx.try_iter() {
+                match p {
+                    EmbeddedFileOrPage::File(path, doc_data) => {
+                        if state
+                            .config
+                            .root_paths
+                            .iter()
+                            .map(|x| x.to_string_lossy().to_string())
+                            .any(|x| path.starts_with(&x))
+                        {
+                            log::info!("Finished processing {path}");
+                            state.loaded_files.insert(path, doc_data);
+                        } else {
+                            log::info!(
+                                "Skipping adding of file {path} to loaded files. No longer matches a root path"
+                            );
+                        }
+                    }
+                    EmbeddedFileOrPage::Page {
+                        path,
+                        last_mtime,
+                        embedding,
+                        page_no,
+                        total_pages,
+                    } => {
+                        if state
+                            .config
+                            .root_paths
+                            .iter()
+                            .map(|x| x.to_string_lossy().to_string())
+                            .any(|x| path.starts_with(&x))
+                        {
+                            state
+                                .loaded_files
+                                .entry(path.clone())
+                                .and_modify(|x| match x.page_embeddings {
+                                    None => {
+                                        // create new document if it does not exist
+                                        x.page_embeddings = Some(PageEmbeddings::from_single_page(
+                                            &embedding,
+                                            page_no,
+                                            total_pages,
+                                        ));
+                                    }
+                                    Some(ref mut page_embeddings) => {
+                                        if x.last_mtime < last_mtime {
+                                            // if we get a page with newer mtime than the document,
+                                            // document is outdated. therefore reinitialize whole document
+                                            *page_embeddings = PageEmbeddings::from_single_page(
+                                                &embedding,
+                                                page_no,
+                                                total_pages,
+                                            );
+                                        } else if x.last_mtime == last_mtime {
+                                            page_embeddings.push_page(&embedding, page_no);
+                                        } else {
+                                            // ignore
+                                            log::info!(
+                                                "Got old page {} for document {path}. ignoring",
+                                                page_no + 1
+                                            );
+                                        }
+                                    }
+                                })
+                                .or_insert_with(|| DocData {
+                                    last_mtime,
+                                    page_embeddings: Some(PageEmbeddings::from_single_page(
+                                        &embedding,
+                                        page_no,
+                                        total_pages,
+                                    )),
+                                });
+                        } else {
+                            log::info!(
+                                "Skipping adding of file {path} to loaded files. No longer matches a root path"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -909,7 +1063,7 @@ fn config_editor(state: &State) -> iced::Element<'_, Message> {
 }
 
 fn show_log(state: &State) -> iced::Element<'_, Message> {
-    use iced::widget::{column, container, scrollable, text, space};
+    use iced::widget::{column, container, scrollable, space, text};
     let palette = state.config.theme.palette();
 
     container(column!(
@@ -926,7 +1080,7 @@ fn show_log(state: &State) -> iced::Element<'_, Message> {
 }
 
 fn show_documents(state: &State) -> iced::Element<'_, Message> {
-    use iced::widget::{column, container, scrollable, text, space};
+    use iced::widget::{column, container, scrollable, space, text};
     let palette = state.config.theme.palette();
     container(
         scrollable(column!(
@@ -1052,12 +1206,23 @@ struct LogMessage {
     time: chrono::DateTime<chrono::Local>,
 }
 
+enum EmbeddedFileOrPage {
+    File(String, DocData),
+    Page {
+        path: String,
+        last_mtime: std::time::SystemTime,
+        embedding: Tensor,
+        page_no: usize,
+        total_pages: usize,
+    },
+}
+
 struct EmbedThreadHandles {
     query_request_rx: crossbeam_channel::Receiver<String>,
     query_embedding_tx: crossbeam_channel::Sender<(String, Tensor)>,
 
     file_request_rx: crossbeam_channel::Receiver<PathBuf>,
-    file_embedding_tx: crossbeam_channel::Sender<(String, DocData)>,
+    file_embedding_tx: crossbeam_channel::Sender<EmbeddedFileOrPage>,
 
     num_files_tx: crossbeam_channel::Sender<isize>,
 
@@ -1076,12 +1241,14 @@ fn send_log(
         .context("send log message")
 }
 
+struct EmbeddedPage {}
+
 struct EmbedHandles {
     query_request_tx: crossbeam_channel::Sender<String>,
     query_embedding_rx: crossbeam_channel::Receiver<(String, Tensor)>,
 
     file_request_tx: crossbeam_channel::Sender<PathBuf>,
-    file_embedding_rx: crossbeam_channel::Receiver<(String, DocData)>,
+    file_embedding_rx: crossbeam_channel::Receiver<EmbeddedFileOrPage>,
 
     num_files_rx: crossbeam_channel::Receiver<isize>,
 
@@ -1156,9 +1323,9 @@ fn embed_single_page(
 
 fn embed_worker(
     query_rx: crossbeam_channel::Receiver<String>,
-    page_rx: crossbeam_channel::Receiver<(PathBuf, usize, usize, DynamicImage)>,
+    page_rx: crossbeam_channel::Receiver<(PathBuf, usize, usize, SystemTime, DynamicImage)>,
     query_tx: crossbeam_channel::Sender<(String, Tensor)>,
-    page_tx: crossbeam_channel::Sender<(PathBuf, usize, Tensor)>,
+    page_tx: crossbeam_channel::Sender<EmbeddedFileOrPage>,
     log_tx: crossbeam_channel::Sender<LogMessage>,
 ) {
     let embedder = load_model();
@@ -1180,10 +1347,11 @@ fn embed_worker(
                 }
             },
             recv(&page_rx) -> res => match res {
-                Ok((path, page_no, n_pages, image)) => {
-                    let embedding = embed_single_page(image, &embedder).unwrap().squeeze(0).unwrap();
+                Ok((path, page_no, n_pages, last_mtime, image)) => {
+                    let embedding = embed_single_page(image, &embedder).unwrap().squeeze(0).unwrap().to_device(&candle_core::Device::Cpu).unwrap();
                     let _ = send_log(&log_tx, format!("Embedding Page {}/{} of {}", page_no + 1, n_pages, path.display())).unwrap();
-                    let _ = page_tx.send((path, page_no, embedding.to_device(&candle_core::Device::Cpu).unwrap())).unwrap();
+                    let ret = EmbeddedFileOrPage::Page{path: path.to_string_lossy().to_string(),last_mtime: last_mtime,embedding,page_no, total_pages: n_pages };
+                    let _ = page_tx.send(ret);
                 }
                 Err(e) => {
                     log::error!("[embed_worker] Could not receive from channel: {e}. Exiting...");
@@ -1196,45 +1364,63 @@ fn embed_worker(
 
 fn handle_file_request(
     path: impl AsRef<Path>,
-    file_embedding_tx: &crossbeam_channel::Sender<(String, DocData)>,
-    page_request_tx: &crossbeam_channel::Sender<(PathBuf, usize, usize, DynamicImage)>,
-    current_documents: &mut HashMap<PathBuf, (Vec<Option<Tensor>>, SystemTime)>,
+    partial_doc_data: Option<DocData>,
+    file_embedding_tx: &crossbeam_channel::Sender<EmbeddedFileOrPage>,
+    page_request_tx: &crossbeam_channel::Sender<(PathBuf, usize, usize, SystemTime, DynamicImage)>,
 ) -> bool {
     let meta = std::fs::metadata(&path).unwrap();
     let modified = meta.modified().unwrap();
 
-    let mut pages = match embed_anything::embeddings::local::colpali::get_images_from_pdf(&path) {
-        Ok(pages) => pages,
-        Err(err) => {
-            log::error!(
-                "Could not render pages of document {}: {err}. Skipping...",
-                path.as_ref().display()
-            );
-            let doc_data = DocData {
-                last_mtime: modified,
-                page_embeddings: None,
-            };
-            file_embedding_tx
-                .send((path.as_ref().to_string_lossy().to_string(), doc_data))
-                .unwrap();
+    let (mut numbers_pages, pages_in_doc) =
+        match embed_anything::embeddings::local::colpali::get_images_from_pdf(&path) {
+            Ok(pages) => {
+                if let Some(partial_doc_data) = partial_doc_data {
+                    let mut embeddings = partial_doc_data
+                        .page_embeddings
+                        .expect("we only enter this if page embeddigs are present");
+                    let numbers = embeddings.page_numbers.drain(..).collect::<HashSet<_>>();
+                    let n_pages = pages.len();
+                    (
+                        pages
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(i, _)| !numbers.contains(&i))
+                            .collect::<Vec<_>>(),
+                        n_pages,
+                    )
+                } else {
+                    let n_pages = pages.len();
+                    (pages.into_iter().enumerate().collect::<Vec<_>>(), n_pages)
+                }
+            }
+            Err(err) => {
+                log::error!(
+                    "Could not render pages of document {}: {err}. Skipping...",
+                    path.as_ref().display()
+                );
+                let doc_data = DocData {
+                    last_mtime: modified,
+                    page_embeddings: None,
+                };
+                file_embedding_tx
+                    .send(EmbeddedFileOrPage::File(
+                        path.as_ref().to_string_lossy().to_string(),
+                        doc_data,
+                    ))
+                    .unwrap();
 
-            return false;
-        }
-    };
+                return false;
+            }
+        };
 
-    let mut page_data = Vec::<Option<Tensor>>::new();
-    let n_pages = pages.len();
-    page_data.resize(n_pages, None);
-    current_documents.insert(path.as_ref().to_path_buf(), (page_data, modified));
-
-    for (i, p) in pages.drain(..).enumerate() {
+    for (i, p) in numbers_pages.drain(..) {
         log::info!(
-            "Sending page embed request for page {}/{n_pages} of {}",
+            "Sending page embed request for page {}/{pages_in_doc} of {}",
             i,
             path.as_ref().display()
         );
         page_request_tx
-            .send((path.as_ref().to_path_buf(), i, n_pages, p))
+            .send((path.as_ref().to_path_buf(), i, pages_in_doc, modified, p))
             .unwrap();
     }
 
@@ -1242,21 +1428,21 @@ fn handle_file_request(
 }
 
 fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
-    let mut current_documents: HashMap<PathBuf, (Vec<Option<Tensor>>, SystemTime)> = HashMap::new();
     let (query_request_tx, query_request_rx) = crossbeam_channel::unbounded();
     let (page_request_tx, page_request_rx) = crossbeam_channel::unbounded();
     let (query_embedding_tx, query_embedding_rx) = crossbeam_channel::unbounded();
-    let (page_embedding_tx, page_embedding_rx) = crossbeam_channel::unbounded();
-    let (own_file_request_tx, own_file_request_rx) = crossbeam_channel::unbounded::<PathBuf>();
+    // let (page_embedding_tx, page_embedding_rx) = crossbeam_channel::unbounded();
+    let (own_file_request_tx, own_file_request_rx) =
+        crossbeam_channel::unbounded::<(PathBuf, Option<DocData>)>();
 
     let lt = et.log_tx.clone();
-    let pt = page_embedding_tx.clone();
+    let ft = et.file_embedding_tx.clone();
     let handle = std::thread::spawn(|| {
         embed_worker(
             query_request_rx,
             page_request_rx,
             query_embedding_tx,
-            pt,
+            ft,
             lt,
         )
     });
@@ -1293,11 +1479,19 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
                 let modified = meta.modified().unwrap();
                 let key = f.to_string_lossy().to_string();
 
-                if loaded_files.contains_key(&key) && loaded_files[&key].last_mtime >= modified {
-                    log::info!("Skipping {key}. Already embedded before");
+                if loaded_files.contains_key(&key) {
+                    if loaded_files[&key].last_mtime >= modified && loaded_files[&key].is_complete()
+                    {
+                        log::info!("Skipping {key}. Already embedded before");
+                    } else {
+                        // put into file requests if partially embedded, but keep in loaded_files.
+                        own_file_request_tx
+                            .send((f, Some(loaded_files[&key].clone())))
+                            .unwrap();
+                    }
                 } else {
                     log::info!("Queuing embedding of {key}");
-                    own_file_request_tx.send(f).unwrap();
+                    own_file_request_tx.send((f, None)).unwrap();
                     et.num_files_tx.send(1).unwrap();
                 }
             }
@@ -1306,7 +1500,9 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
         et.num_files_tx.send(loaded_files.len() as isize).unwrap();
 
         for (file, embed) in loaded_files.drain() {
-            et.file_embedding_tx.send((file, embed)).unwrap();
+            et.file_embedding_tx
+                .send(EmbeddedFileOrPage::File(file, embed))
+                .unwrap(); // TODO: make type an enum
         }
     }
 
@@ -1319,15 +1515,11 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
         let mut select = crossbeam_channel::Select::new_biased();
         select.recv(&query_embedding_rx);
         select.recv(&et.query_request_rx);
-        select.recv(&page_embedding_rx);
 
-        let file_request_receivers = if page_request_tx.len() < 500 {
+        if page_request_tx.len() < 500 {
             select.recv(&own_file_request_rx);
             select.recv(&et.file_request_rx);
-            Some([&own_file_request_rx, &et.file_request_rx])
-        } else {
-            None
-        };
+        }
 
         let op = select.select();
 
@@ -1350,74 +1542,53 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
                     break;
                 }
             },
-            2 => match op.recv(&page_embedding_rx) {
-                Ok((path, page_no, embedding)) => {
-                    let finished = {
-                        let Some((embeddings, _)) = current_documents.get_mut(&path) else {
-                            et.num_files_tx.send(-1).unwrap();
-                            log::warn!(
-                                "[embed_thread] Got embedding for document which has been canceled ({}). Skipping.",
+            2 => match op.recv(&own_file_request_rx) {
+                Ok((path, partial_doc_data)) => {
+                    log::info!("Received embedding request for document {}", path.display());
+                    if !handle_file_request(
+                        &path,
+                        partial_doc_data,
+                        &et.file_embedding_tx,
+                        &page_request_tx,
+                    ) {
+                        send_log(
+                            &et.log_tx,
+                            format!(
+                                "Skipped file {} due to error in page processing.",
                                 path.display()
-                            );
-                            break;
-                        };
-                        embeddings[page_no] = Some(embedding);
-                        embeddings.iter().all(|x| x.is_some())
+                            ),
+                        )
+                        .unwrap();
                     };
-                    if finished {
-                        let (mut embeddings, modified) = current_documents
-                            .remove(&path)
-                            .expect("we use it just above");
-                        let embeddings = embeddings
-                            .drain(..)
-                            .map(|x| x.expect("we check all are Some above"))
-                            .collect::<Vec<_>>();
-                        let doc_data = DocData {
-                            last_mtime: modified,
-                            page_embeddings: Some(PageEmbeddings::from_pages(embeddings)),
-                        };
-                        et.file_embedding_tx
-                            .send((path.to_string_lossy().to_string(), doc_data))
-                            .unwrap();
-                    }
                 }
-                Err(err) => {
+                Err(e) => {
                     log::error!(
-                        "[embed_thread] could not receive page embedding request: {err}. Aborting"
+                        "Error in embedding thread trying to receive from file request channel: {e}. Aborting"
                     );
                     break;
                 }
             },
-            x if x == 3 || x == 4 => {
-                let file_request_receivers = file_request_receivers
-                    .expect("this branch can only happen if we have file requests in select");
-                match op.recv(file_request_receivers[x - 3]) {
-                    Ok(path) => {
-                        log::info!("Received embedding request for document {}", path.display());
-                        if !handle_file_request(
-                            &path,
-                            &et.file_embedding_tx,
-                            &page_request_tx,
-                            &mut current_documents,
-                        ) {
-                            send_log(
-                                &et.log_tx,
-                                format!(
-                                    "Skipped file {} due to error in page processing.",
-                                    path.display()
-                                ),
-                            )
-                            .unwrap();
-                        };
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Error in embedding thread trying to receive from file request channel: {e}. Aborting"
-                        );
-                        break;
-                    }
+            3 => match op.recv(&et.file_request_rx) {
+                Ok(path) => {
+                    log::info!("Received embedding request for document {}", path.display());
+                    if !handle_file_request(&path, None, &et.file_embedding_tx, &page_request_tx) {
+                        send_log(
+                            &et.log_tx,
+                            format!(
+                                "Skipped file {} due to error in page processing.",
+                                path.display()
+                            ),
+                        )
+                        .unwrap();
+                    };
                 }
-            }
+                Err(e) => {
+                    log::error!(
+                        "Error in embedding thread trying to receive from file request channel: {e}. Aborting"
+                    );
+                    break;
+                }
+            },
             _ => unreachable!(),
         }
     }
@@ -1585,7 +1756,7 @@ fn main() -> iced::Result {
             if state.handles.file_embedding_rx.len() > 0 {
                 subscriptions.push(
                     iced::time::every(std::time::Duration::from_millis(250))
-                        .map(|_| Message::DocumentProcessed),
+                        .map(|_| Message::PageProcessed),
                 );
             }
 
