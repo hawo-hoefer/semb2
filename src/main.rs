@@ -1033,11 +1033,14 @@ fn config_editor(state: &State) -> iced::Element<'_, Message> {
         ),
         row!(column(state.config.root_paths.iter().enumerate().map(
             |(i, p)| {
-                row!(
-                    space().width(spc * 4.0),
-                    button(text("❌").size(th).center()).on_press(Message::RemoveSearchPath(i)),
-                    space().width(spc),
-                    centered_text(p.to_string_lossy(), pad, th),
+                column!(
+                    row!(
+                        space().width(spc * 4.0),
+                        button(text("❌").size(th).center()).on_press(Message::RemoveSearchPath(i)),
+                        space().width(spc),
+                        centered_text(p.to_string_lossy(), pad, th),
+                    ),
+                    space().height(spc),
                 )
                 .into()
             }
@@ -1433,9 +1436,7 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
     });
 
     {
-        let mut loaded_files = load_saved_embeddings(
-            &candle_core::Device::Cpu,
-        );
+        let mut loaded_files = load_saved_embeddings(&candle_core::Device::Cpu);
         log::info!("loaded saved embeddings for {} files.", loaded_files.len());
 
         for p in root_paths {
@@ -1681,9 +1682,7 @@ fn locate_documents(state: &mut State, root: impl AsRef<Path>) -> usize {
     n
 }
 
-fn load_saved_embeddings(
-    device: &candle_core::Device,
-) -> HashMap<String, DocData> {
+fn load_saved_embeddings(device: &candle_core::Device) -> HashMap<String, DocData> {
     std::fs::File::open(&PATHS.embedding_cache_path)
         .map_err(|x| anyhow::Error::from(x))
         .map(std::io::BufReader::new)
