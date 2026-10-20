@@ -17,4 +17,5 @@ $ cargo install --path .
 - [x] add status messages
 - [x] add placeholders for files which errored during loading so we don't have to load them again
 - [ ] regularily update progress bar instead of only on-focus
-- [ ] log is only shown if results are present
+- [x] log is only shown if results are present
+- [ ] limiting memory consumption causes embedding thread to block on trying to send to queue. fix
