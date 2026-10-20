@@ -200,6 +200,17 @@ struct State {
     log: Vec<LogMessage>,
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        save_embeddings(&self.loaded_files).unwrap_or_else(|err| {
+            log::error!(
+                "Could not save embeddings to {}: {err}",
+                PATHS.embedding_cache_path.display()
+            );
+        });
+    }
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct Viewer {
     program_name: String,
@@ -590,12 +601,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     .any(|x| path.starts_with(&x))
                 {
                     state.loaded_files.insert(path, doc_data);
-                    save_embeddings(&state.loaded_files).unwrap_or_else(|err| {
-                        log::error!(
-                            "Could not save embeddings to {}: {err}",
-                            PATHS.embedding_cache_path.display()
-                        );
-                    });
                 } else {
                     log::info!(
                         "Skipping adding of file {path} to loaded files. No longer matches a root path"
@@ -1213,6 +1218,7 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
             &std::path::PathBuf::from(&PATHS.embedding_cache_path),
             &candle_core::Device::Cpu,
         );
+        log::info!("loaded saved embeddings for {} files.", loaded_files.len());
 
         for p in root_paths {
             for f in walkdir::WalkDir::new(p).into_iter().filter_map(|f| {
