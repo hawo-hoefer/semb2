@@ -12,9 +12,8 @@ use iced::keyboard::Key;
 use iced::widget::combo_box;
 use iced::widget::image::Handle;
 use iced::widget::operation::AbsoluteOffset;
-use iced::{Element, Subscription, Task, Theme, stream};
+use iced::{Element, Subscription, Task, Theme};
 use image::DynamicImage;
-use pdf2image::PDF;
 use serde::Serialize;
 use wincode::len::BincodeLen;
 
@@ -147,18 +146,6 @@ impl PageEmbeddings {
             allocated_chunks: n_chunks,
             page_sizes: vec![n_chunks],
             page_numbers: vec![page_num],
-            total_pages,
-        }
-    }
-
-    fn from_pages(pages: Vec<Tensor>, page_numbers: Vec<usize>, total_pages: usize) -> Self {
-        let sizes = pages.iter().map(|x| x.dim(0).unwrap()).collect();
-        let embeddings = Tensor::cat(&pages, 0).expect("have same first dim");
-        Self {
-            page_sizes: sizes,
-            page_numbers: page_numbers,
-            allocated_chunks: embeddings.dim(0).unwrap(),
-            data: embeddings,
             total_pages,
         }
     }
@@ -1241,8 +1228,6 @@ fn send_log(
         .context("send log message")
 }
 
-struct EmbeddedPage {}
-
 struct EmbedHandles {
     query_request_tx: crossbeam_channel::Sender<String>,
     query_embedding_rx: crossbeam_channel::Receiver<(String, Tensor)>,
@@ -1449,7 +1434,6 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
 
     {
         let mut loaded_files = load_saved_embeddings(
-            &std::path::PathBuf::from(&PATHS.embedding_cache_path),
             &candle_core::Device::Cpu,
         );
         log::info!("loaded saved embeddings for {} files.", loaded_files.len());
@@ -1698,10 +1682,9 @@ fn locate_documents(state: &mut State, root: impl AsRef<Path>) -> usize {
 }
 
 fn load_saved_embeddings(
-    save_path: &impl AsRef<std::path::Path>,
     device: &candle_core::Device,
 ) -> HashMap<String, DocData> {
-    std::fs::File::open(save_path)
+    std::fs::File::open(&PATHS.embedding_cache_path)
         .map_err(|x| anyhow::Error::from(x))
         .map(std::io::BufReader::new)
         .and_then(|mut x| {
