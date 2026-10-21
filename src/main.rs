@@ -1,12 +1,7 @@
-use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
 use anyhow::Context;
 use candle_core::{DType, IndexOp, Tensor};
 use embed_anything::embeddings::local::colsmol::ColSmolEmbedder;
+use embed_anything::embeddings::select_device;
 use iced::Length::Fill;
 use iced::keyboard::Key;
 use iced::widget::combo_box;
@@ -15,6 +10,11 @@ use iced::widget::operation::AbsoluteOffset;
 use iced::{Element, Subscription, Task, Theme};
 use image::DynamicImage;
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use wincode::len::BincodeLen;
 
 pub struct Paths {
@@ -170,9 +170,10 @@ impl PageEmbeddings {
         const QUERY_DIM: usize = 0;
         const CHUNK_DIM: usize = 1;
         const FEATURE_DIM: usize = 2;
+        let device = select_device();
 
-        let qe = query.unsqueeze(CHUNK_DIM)?;
-        let de = self.data.unsqueeze(QUERY_DIM)?;
+        let qe = query.unsqueeze(CHUNK_DIM)?.to_device(&device).unwrap();
+        let de = self.data.unsqueeze(QUERY_DIM)?.to_device(&device).unwrap();
         let dot_product = qe.broadcast_mul(&de)?.sum((FEATURE_DIM,))?;
 
         let mut start = 0;
