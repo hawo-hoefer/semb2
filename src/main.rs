@@ -255,8 +255,12 @@ impl Hash for DocData {
 
 fn load_model() -> ColSmolEmbedder {
     log::info!("Loading Model");
+    let start = std::time::Instant::now();
     let ret = ColSmolEmbedder::new("akshayballal/colSmol-256M-merged", None).unwrap();
-    log::info!("Done Loading Model");
+    log::info!(
+        "Done Loading Model (took {:.2}s)",
+        start.elapsed().as_secs_f32()
+    );
     ret
 }
 
@@ -624,12 +628,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
             state.highlight_index = 0;
             state.results.clear();
+            let start = std::time::Instant::now();
+            let mut n_pages = 0;
             for (path, v) in state.loaded_files.iter() {
                 let Some(ref doc_embedding) = v.page_embeddings else {
                     continue;
                 };
-
-                // TODO: think about moving this back to the GPU if it's too slow
+                n_pages += doc_embedding.page_numbers.len();
                 let scores = doc_embedding.compute_max_sim(&query_embedding).unwrap();
 
                 for (score, i) in scores.into_iter().zip(&doc_embedding.page_numbers) {
@@ -640,6 +645,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     })
                 }
             }
+            let elapsed = start.elapsed().as_secs_f32();
+            log::info!("got results for {n_pages} pages in {elapsed:.3}s.");
 
             state
                 .results
@@ -1448,8 +1455,13 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
     });
 
     {
+        let start = std::time::Instant::now();
         let mut loaded_files = load_saved_embeddings(&candle_core::Device::Cpu);
-        log::info!("loaded saved embeddings for {} files.", loaded_files.len());
+        log::info!(
+            "loaded saved embeddings for {} files (took {:.2}s).",
+            loaded_files.len(),
+            start.elapsed().as_secs_f32()
+        );
 
         for p in root_paths {
             for f in walkdir::WalkDir::new(p).into_iter().filter_map(|f| {
