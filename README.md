@@ -22,3 +22,4 @@ $ cargo install --path .
 - [x] log is only shown if results are present
 - [x] limiting memory consumption causes embedding thread to block on trying to send to queue. fix
 - [ ] improve search performance using HNSWlib
+- [ ] when embedding queue is empty, papers aren't being pushed into it
