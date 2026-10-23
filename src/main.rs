@@ -172,23 +172,38 @@ impl PageEmbeddings {
         const FEATURE_DIM: usize = 2;
         let device = select_device();
 
+        const PAGES_PER_BATCH: usize = 30;
         let qe = query.unsqueeze(CHUNK_DIM)?.to_device(&device).unwrap();
-        let de = self.data.unsqueeze(QUERY_DIM)?.to_device(&device).unwrap();
-        let dot_product = qe.broadcast_mul(&de)?.sum((FEATURE_DIM,))?;
 
-        let mut start = 0;
         let mut scores = Vec::with_capacity(self.page_sizes.len());
-        for p in self.page_sizes.iter() {
-            assert!(start + p <= self.allocated_chunks);
+        let mut outer_start = 0;
+        for page_chunk in self.page_sizes.chunks(PAGES_PER_BATCH) {
+            let chunk_size = page_chunk.iter().sum::<usize>();
+            assert!(outer_start + chunk_size <= self.allocated_chunks);
+            let de = self
+                .data
+                .i((outer_start..outer_start + chunk_size, ..))
+                .unwrap()
+                .unsqueeze(QUERY_DIM)?
+                .to_device(&device)
+                .unwrap();
+            outer_start += chunk_size;
 
-            scores.push(
-                dot_product
-                    .i((.., start..start + p))?
-                    .max(CHUNK_DIM)?
-                    .sum(QUERY_DIM)?
-                    .to_vec0()?,
-            );
-            start += p;
+            let dot_product = qe.broadcast_mul(&de)?.sum((FEATURE_DIM,))?;
+
+            let mut start = 0;
+            for p in page_chunk {
+                // assert!(start + p <= self.allocated_chunks);
+
+                scores.push(
+                    dot_product
+                        .i((.., start..start + p))?
+                        .max(CHUNK_DIM)?
+                        .sum(QUERY_DIM)?
+                        .to_vec0()?,
+                );
+                start += p;
+            }
         }
 
         Ok(scores)
@@ -1076,10 +1091,14 @@ fn show_log(state: &State) -> iced::Element<'_, Message> {
     let palette = state.config.theme.palette();
 
     container(column!(
-        text("Log").color(palette.primary).size(state.config.text_height),
+        text("Log")
+            .color(palette.primary)
+            .size(state.config.text_height),
         space().height(state.config.spacing),
         scrollable(column(state.log.iter().rev().map(|x| {
-            text(format!("[{}] {}", x.time.format("%H:%M:%S"), x.msg)).size(state.config.text_height).into()
+            text(format!("[{}] {}", x.time.format("%H:%M:%S"), x.msg))
+                .size(state.config.text_height)
+                .into()
         })))
         .height(10.0 * (state.config.text_height + state.config.padding))
         .width(Fill),
