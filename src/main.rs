@@ -1112,7 +1112,9 @@ fn show_documents(state: &State) -> iced::Element<'_, Message> {
     let palette = state.config.theme.palette();
     container(
         scrollable(column!(
-            text("Loaded Documents").color(palette.primary),
+            text("Loaded Documents")
+                .color(palette.primary)
+                .size(state.config.text_height),
             space().height(state.config.spacing),
             column(state.loaded_files.iter().map(|(path, doc_data)| {
                 use safetensors::View;
@@ -1131,6 +1133,7 @@ fn show_documents(state: &State) -> iced::Element<'_, Message> {
                     "[{}] {n_pages} Pages ({size:.1} MB) {path}",
                     mtime.format("%d.%m.%y %H:%M:%S")
                 ))
+                .size(state.config.text_height)
                 .into()
             }))
         ))
