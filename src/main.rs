@@ -1110,25 +1110,35 @@ fn show_log(state: &State) -> iced::Element<'_, Message> {
 fn show_documents(state: &State) -> iced::Element<'_, Message> {
     use iced::widget::{column, container, scrollable, space, text};
     let palette = state.config.theme.palette();
+    let mut doc_infos = state
+        .loaded_files
+        .iter()
+        .map(|(path, doc_data)| {
+            use safetensors::View;
+            let size = doc_data
+                .page_embeddings
+                .as_ref()
+                .map(|x| x.data.data_len())
+                .unwrap_or(0);
+            let n_pages = doc_data
+                .page_embeddings
+                .as_ref()
+                .map(|x| x.page_sizes.len())
+                .unwrap_or(0);
+            let mtime: chrono::DateTime<chrono::Local> = doc_data.last_mtime.into();
+            (path, mtime, n_pages, size)
+        })
+        .collect::<Vec<_>>();
+    doc_infos.sort_by_key(|x| -(x.3 as isize));
+
     container(
         scrollable(column!(
             text("Loaded Documents")
                 .color(palette.primary)
                 .size(state.config.text_height),
             space().height(state.config.spacing),
-            column(state.loaded_files.iter().map(|(path, doc_data)| {
-                use safetensors::View;
-                let mtime: chrono::DateTime<chrono::Local> = doc_data.last_mtime.into();
-                let n_pages = doc_data
-                    .page_embeddings
-                    .as_ref()
-                    .map(|x| x.page_sizes.len())
-                    .unwrap_or(0);
-                let size = doc_data
-                    .page_embeddings
-                    .as_ref()
-                    .map(|x| x.data.data_len() as f32 / (1024 * 1024) as f32)
-                    .unwrap_or(0.0);
+            column(doc_infos.iter().map(|(path, mtime, n_pages, size)| {
+                let size = *size as f32 / (1024 * 1024) as f32;
                 text(format!(
                     "[{}] {n_pages} Pages ({size:.1} MB) {path}",
                     mtime.format("%d.%m.%y %H:%M:%S")
