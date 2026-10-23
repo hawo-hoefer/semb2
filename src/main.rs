@@ -1076,10 +1076,10 @@ fn show_log(state: &State) -> iced::Element<'_, Message> {
     let palette = state.config.theme.palette();
 
     container(column!(
-        text("Log").color(palette.primary),
+        text("Log").color(palette.primary).size(state.config.text_height),
         space().height(state.config.spacing),
         scrollable(column(state.log.iter().rev().map(|x| {
-            text(format!("[{}] {}", x.time.format("%H:%M:%S"), x.msg)).into()
+            text(format!("[{}] {}", x.time.format("%H:%M:%S"), x.msg)).size(state.config.text_height).into()
         })))
         .height(10.0 * (state.config.text_height + state.config.padding))
         .width(Fill),
