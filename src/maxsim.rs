@@ -1,8 +1,8 @@
-use candle_core::Tensor;
 use candle_core::CustomOp2;
-use candle_core::backend::{BackendStorage, BackendDevice};
-use candle_core::cuda_backend::cudarc::driver::PushKernelArg;
+use candle_core::Tensor;
+use candle_core::backend::{BackendDevice, BackendStorage};
 use candle_core::cuda_backend::WrapErr;
+use candle_core::cuda_backend::cudarc::driver::PushKernelArg;
 
 mod kernels {
     include!("cuda_kernels.rs");
@@ -81,10 +81,10 @@ impl CustomOp2 for MaxSim {
         let cfg = LaunchConfig {
             block_dim: (1024, 1, 1),
             grid_dim: (self.document_lengths.len() as u32, 1, 1),
-            shared_mem_bytes: (q_dims[0] * std::mem::size_of::<f32>()) as u32,
+            shared_mem_bytes: (q_dims[0] * std::mem::size_of::<half::f16>()) as u32,
         };
 
-        let dst = unsafe { dev.alloc::<f32>(self.document_lengths.len()) }?;
+        let dst = unsafe { dev.alloc::<half::f16>(self.document_lengths.len()) }?;
         let lengths = Tensor::from_iter(
             self.document_lengths.iter().map(|x| *x as i32),
             &candle_core::Device::Cuda(query.device().clone()),
@@ -114,8 +114,8 @@ impl CustomOp2 for MaxSim {
 
         let mut builder = func.builder();
         builder
-            .arg(query.as_cuda_slice::<f32>()?)
-            .arg(document.as_cuda_slice::<f32>()?)
+            .arg(query.as_cuda_slice::<half::f16>()?)
+            .arg(document.as_cuda_slice::<half::f16>()?)
             .arg(starts.as_cuda_slice::<i32>()?)
             .arg(lengths.as_cuda_slice::<i32>()?)
             .arg(&dst);
@@ -126,6 +126,3 @@ impl CustomOp2 for MaxSim {
         Ok((dst, (self.document_lengths.len(),).into()))
     }
 }
-
-
-

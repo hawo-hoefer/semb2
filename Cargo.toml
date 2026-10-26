@@ -12,6 +12,7 @@ colog = "1.4.0"
 crossbeam-channel = "0.5.17"
 directories = "6.0.0"
 embed_anything = { version="0.7.0", default-features = false, features = ["rustls-tls", "ort", "cuda", "cudnn"] }
+half = "2.7.1"
 iced = { version = "0.14.0", features = ["advanced", "smol", "markdown", "image-without-codecs"] }
 image = "0.25.10"
 itertools = "0.15.0"

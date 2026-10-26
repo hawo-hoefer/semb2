@@ -6556,6 +6556,7 @@ dependencies = [
  "cudaforge",
  "directories",
  "embed_anything",
+ "half",
  "iced",
  "image",
  "itertools 0.15.0",

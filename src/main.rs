@@ -62,7 +62,7 @@ fn embed_query(embedder: &ColSmolEmbedder, query: &str) -> Result<Tensor, anyhow
         .write()
         .map_err(|e| anyhow::anyhow!("{}", e))?
         .forward(&input_ids, &attention_mask, &None, &None)?
-        .to_dtype(DType::F32)?)
+        .to_dtype(DType::F16)?)
 }
 
 fn normalize(embeddings: Tensor) -> Result<Tensor, anyhow::Error> {
@@ -101,6 +101,8 @@ impl SavedEmbedding {
                 .unwrap()
                 .flatten_all()
                 .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
                 .to_vec1()
                 .unwrap(),
             shape,
@@ -111,7 +113,10 @@ impl SavedEmbedding {
     }
 
     fn into_loaded(self, device: &candle_core::Device) -> PageEmbeddings {
-        let embeddings = Tensor::from_vec(self.data, self.shape, device).unwrap();
+        let embeddings = Tensor::from_vec(self.data, self.shape, device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         PageEmbeddings {
             page_sizes: self.page_sizes,
             page_numbers: self.page_numbers,
@@ -193,7 +198,7 @@ impl PageEmbeddings {
                 let res = res.to_device(&candle_core::Device::Cpu).unwrap();
 
                 for i in 0..page_chunk.len() {
-                    scores.push(res.i(i).unwrap().to_vec0().unwrap());
+                    scores.push(res.i(i).unwrap().to_dtype(DType::F32).unwrap().to_vec0().unwrap());
                 }
                 outer_start += chunk_size;
             }
