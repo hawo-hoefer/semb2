@@ -1583,17 +1583,22 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
         }
     }
 
+    let mut last_queue_len = 0;
     loop {
-        log::info!(
-            "Current page embeddings queue size: {}",
-            &page_request_tx.len()
-        );
+        let cur_queue_len = page_request_tx.len();
+        if last_queue_len != cur_queue_len {
+            log::info!("Current page embeddings queue size: {}", &cur_queue_len);
+            last_queue_len = cur_queue_len;
+        }
 
         let mut select = crossbeam_channel::Select::new_biased();
+        let duration = std::time::Duration::from_millis(500);
+        let timeout = crossbeam_channel::after(duration);
+        select.recv(&timeout);
         select.recv(&query_embedding_rx);
         select.recv(&et.query_request_rx);
 
-        if page_request_tx.len() < 500 {
+        if page_request_tx.len() < 100 {
             select.recv(&own_file_request_rx);
             select.recv(&et.file_request_rx);
         }
@@ -1601,7 +1606,11 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
         let op = select.select();
 
         match op.index() {
-            0 => match op.recv(&query_embedding_rx) {
+            0 => {
+                op.recv(&timeout);
+                continue;
+            }
+            1 => match op.recv(&query_embedding_rx) {
                 Ok(qe) => et.query_embedding_tx.send(qe).unwrap(),
                 Err(err) => {
                     log::error!(
@@ -1610,7 +1619,7 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
                     break;
                 }
             },
-            1 => match op.recv(&et.query_request_rx) {
+            2 => match op.recv(&et.query_request_rx) {
                 Ok(q) => query_request_tx.send(q).unwrap(),
                 Err(err) => {
                     log::error!(
@@ -1619,7 +1628,7 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
                     break;
                 }
             },
-            2 => match op.recv(&own_file_request_rx) {
+            3 => match op.recv(&own_file_request_rx) {
                 Ok((path, partial_doc_data)) => {
                     log::info!("Received embedding request for document {}", path.display());
                     if !handle_file_request(
@@ -1645,7 +1654,7 @@ fn embed_thread(et: EmbedThreadHandles, root_paths: Vec<impl AsRef<Path>>) {
                     break;
                 }
             },
-            3 => match op.recv(&et.file_request_rx) {
+            4 => match op.recv(&et.file_request_rx) {
                 Ok(path) => {
                     log::info!("Received embedding request for document {}", path.display());
                     if !handle_file_request(&path, None, &et.file_embedding_tx, &page_request_tx) {
