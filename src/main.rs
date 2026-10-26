@@ -1383,7 +1383,7 @@ fn embed_single_page(
             &pixel_attention_mask,
         )
         .context("Error in running model")?
-        .to_dtype(DType::F32)?;
+        .to_dtype(DType::F16)?;
 
     let image_embeddings = image_embeddings
         .unsqueeze(0)
