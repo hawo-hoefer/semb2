@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use wincode::len::BincodeLen;
 
+mod maxsim;
+
 pub struct Paths {
     pub config_path: PathBuf,
     pub embedding_cache_path: PathBuf,
@@ -167,42 +169,71 @@ impl PageEmbeddings {
     ///
     /// * `query`: query embedding of shape [n_query_chunks, embed_dim]
     fn compute_max_sim(&self, query: &Tensor) -> Result<Vec<f32>, anyhow::Error> {
-        const QUERY_DIM: usize = 0;
-        const CHUNK_DIM: usize = 1;
-        const FEATURE_DIM: usize = 2;
-        let device = select_device();
+        cfg_if::cfg_if! {
+        if #[cfg(feature="cuda")] {
+            let device = select_device();
+            const PAGES_PER_BATCH: usize = 1000;
+            let qe = query.to_device(&device).unwrap();
 
-        const PAGES_PER_BATCH: usize = 30;
-        let qe = query.unsqueeze(CHUNK_DIM)?.to_device(&device).unwrap();
+            let mut scores = Vec::with_capacity(self.page_sizes.len());
+            let mut outer_start = 0;
+            for page_chunk in self.page_sizes.chunks(PAGES_PER_BATCH) {
+                let chunk_size = page_chunk.iter().sum::<usize>();
+                let res = qe
+                    .apply_op2(
+                        &self
+                            .data
+                            .i((outer_start..outer_start + chunk_size, ..))
+                            .unwrap()
+                            .to_device(&device)
+                            .unwrap(),
+                        maxsim::MaxSim::new(self.page_sizes.clone()),
+                    )
+                    .unwrap();
+                let res = res.to_device(&candle_core::Device::Cpu).unwrap();
 
-        let mut scores = Vec::with_capacity(self.page_sizes.len());
-        let mut outer_start = 0;
-        for page_chunk in self.page_sizes.chunks(PAGES_PER_BATCH) {
-            let chunk_size = page_chunk.iter().sum::<usize>();
-            assert!(outer_start + chunk_size <= self.allocated_chunks);
-            let de = self
-                .data
-                .i((outer_start..outer_start + chunk_size, ..))
-                .unwrap()
-                .unsqueeze(QUERY_DIM)?
-                .to_device(&device)
-                .unwrap();
-            outer_start += chunk_size;
+                for i in 0..page_chunk.len() {
+                    scores.push(res.i(i).unwrap().to_vec0().unwrap());
+                }
+                outer_start += chunk_size;
+            }
+            } else {
+                const QUERY_DIM: usize = 0;
+                const CHUNK_DIM: usize = 1;
+                const FEATURE_DIM: usize = 2;
+                let device = select_device();
 
-            let dot_product = qe.broadcast_mul(&de)?.sum((FEATURE_DIM,))?;
+                const PAGES_PER_BATCH: usize = 30;
+                let qe = query.unsqueeze(CHUNK_DIM)?.to_device(&device).unwrap();
 
-            let mut start = 0;
-            for p in page_chunk {
-                // assert!(start + p <= self.allocated_chunks);
+                let mut scores = Vec::with_capacity(self.page_sizes.len());
+                let mut outer_start = 0;
+                for page_chunk in self.page_sizes.chunks(PAGES_PER_BATCH) {
+                    let chunk_size = page_chunk.iter().sum::<usize>();
+                    assert!(outer_start + chunk_size <= self.allocated_chunks);
+                    let de = self
+                        .data
+                        .i((outer_start..outer_start + chunk_size, ..))
+                        .unwrap()
+                        .unsqueeze(QUERY_DIM)?
+                        .to_device(&device)
+                        .unwrap();
+                    outer_start += chunk_size;
 
-                scores.push(
-                    dot_product
-                        .i((.., start..start + p))?
-                        .max(CHUNK_DIM)?
-                        .sum(QUERY_DIM)?
-                        .to_vec0()?,
-                );
-                start += p;
+                    let dot_product = qe.broadcast_mul(&de)?.sum((FEATURE_DIM,))?;
+
+                    let mut start = 0;
+                    for p in page_chunk {
+                        scores.push(
+                            dot_product
+                                .i((.., start..start + p))?
+                                .max(CHUNK_DIM)?
+                                .sum(QUERY_DIM)?
+                                .to_vec0()?,
+                        );
+                        start += p;
+                    }
+                }
             }
         }
 
